@@ -136,6 +136,13 @@
       details.about p {
         margin: 8px 0;
       }
+      details.about p.credits {
+        margin-top: 14px;
+        padding-top: 10px;
+        border-top: 1px solid rgba(127, 127, 127, 0.2);
+        font-size: 0.82rem;
+        opacity: 0.75;
+      }
       details.about a {
         color: inherit;
       }
@@ -193,12 +200,24 @@
     <details class="about">
       <summary>How does it work?</summary>
       <p>
-        This is a browser implementation of
-        <a href="https://en.wikipedia.org/wiki/Seam_carving" target="_blank" rel="noreferrer noopener">seam carving</a>,
-        a content-aware resizing algorithm. Instead of scaling every pixel
-        uniformly, it repeatedly finds the lowest-energy connected path of
-        pixels (the "seam") and removes it, so busy regions like faces shrink
-        less than flat regions like backgrounds.
+        This is a browser implementation of <strong>seam carving</strong>, the
+        content-aware resizing algorithm introduced by Shai Avidan and Ariel
+        Shamir in their SIGGRAPH 2007 paper
+        <a
+          href="https://perso.crans.org/frenoy/matlab2012/seamcarving.pdf"
+          target="_blank"
+          rel="noreferrer noopener"
+          >Seam Carving for Content-Aware Image Resizing</a
+        >
+        (<a
+          href="https://dl.acm.org/doi/10.1145/1276377.1276390"
+          target="_blank"
+          rel="noreferrer noopener"
+          >ACM</a
+        >). Instead of scaling every pixel uniformly, it repeatedly finds
+        the lowest-energy connected path of pixels (the "seam") and removes
+        it, so busy regions like faces shrink less than flat regions like
+        backgrounds.
       </p>
       <p>
         Animated GIFs use a shared seam set across all frames so the result
@@ -209,6 +228,31 @@
       <p>
         Carving runs in a Web Worker, so the UI stays responsive while large
         images are processed.
+      </p>
+      <p class="credits">
+        The JavaScript port was directly inspired by Oleksii Trekhleb's
+        write-up
+        <a
+          href="https://trekhleb.dev/blog/2021/content-aware-image-resizing-in-javascript/"
+          target="_blank"
+          rel="noreferrer noopener"
+          >Content-Aware Image Resizing in JavaScript</a
+        >
+        and his
+        <a
+          href="https://trekhleb.dev/js-image-carver/"
+          target="_blank"
+          rel="noreferrer noopener"
+          >js-image-carver</a
+        >
+        demo
+        (<a
+          href="https://github.com/trekhleb/js-image-carver"
+          target="_blank"
+          rel="noreferrer noopener"
+          >source</a
+        >). The animated-GIF and live-video extensions are original to this
+        project.
       </p>
     </details>
     <div id="drop-overlay" class="drop-overlay">Drop image to carve</div>

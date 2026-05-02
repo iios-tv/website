@@ -1,0 +1,221 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Carve - iios.tv</title>
+    <meta
+      name="description"
+      content="Content-aware image and GIF resizing in your browser. Drop in a GIF, PNG, or JPEG and shrink it without squishing the subject."
+    />
+    <style>
+      :root {
+        color-scheme: light dark;
+        font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+      }
+      body {
+        margin: 0;
+        padding: 24px;
+        max-width: 1080px;
+        margin-inline: auto;
+      }
+      h1 {
+        font-size: 1.4rem;
+        margin: 0 0 8px;
+      }
+      p.lede {
+        margin: 0 0 16px;
+        opacity: 0.75;
+        font-size: 0.95rem;
+      }
+      .controls {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 12px;
+        align-items: center;
+        margin-bottom: 16px;
+      }
+      .controls label {
+        font-size: 0.85rem;
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+      }
+      .controls input[type="number"] {
+        width: 64px;
+      }
+      .controls button {
+        padding: 6px 14px;
+        font-size: 0.9rem;
+        cursor: pointer;
+      }
+      .preview {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 16px;
+        align-items: start;
+      }
+      .preview > div {
+        display: flex;
+        flex-direction: column;
+        gap: 6px;
+      }
+      .preview img {
+        max-width: 100%;
+        image-rendering: pixelated;
+        background:
+          linear-gradient(45deg, #e0e0e0 25%, transparent 25%, transparent 75%, #e0e0e0 75%) 0 0/16px 16px,
+          linear-gradient(45deg, #e0e0e0 25%, transparent 25%, transparent 75%, #e0e0e0 75%) 8px 8px/16px 16px;
+      }
+      .preview .label {
+        font-size: 0.8rem;
+        opacity: 0.7;
+      }
+      .preview .label-row {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 8px;
+      }
+      .download-btn {
+        font-size: 0.8rem;
+        padding: 3px 10px;
+        border-radius: 4px;
+        border: 1px solid currentColor;
+        text-decoration: none;
+        color: inherit;
+        opacity: 0.85;
+        line-height: 1.2;
+      }
+      .download-btn:hover {
+        opacity: 1;
+        background: rgba(127, 127, 127, 0.12);
+      }
+      .download-btn[hidden] {
+        display: none;
+      }
+      pre.timings {
+        margin-top: 16px;
+        padding: 8px 12px;
+        background: rgba(127, 127, 127, 0.12);
+        border-radius: 4px;
+        font-size: 0.8rem;
+        white-space: pre-wrap;
+      }
+      .status {
+        margin-top: 12px;
+        font-size: 0.85rem;
+        opacity: 0.8;
+        min-height: 1.2em;
+      }
+      nav.site-nav {
+        display: flex;
+        gap: 12px;
+        font-size: 0.85rem;
+        margin-bottom: 12px;
+      }
+      nav.site-nav a {
+        opacity: 0.75;
+        text-decoration: none;
+      }
+      nav.site-nav a[aria-current="page"] {
+        opacity: 1;
+        font-weight: 600;
+        text-decoration: underline;
+      }
+      details.about {
+        margin-top: 24px;
+        font-size: 0.9rem;
+        opacity: 0.85;
+        line-height: 1.5;
+      }
+      details.about summary {
+        cursor: pointer;
+        font-weight: 600;
+      }
+      details.about p {
+        margin: 8px 0;
+      }
+      details.about a {
+        color: inherit;
+      }
+      footer.site-footer {
+        margin-top: 32px;
+        padding-top: 12px;
+        border-top: 1px solid rgba(127, 127, 127, 0.25);
+        font-size: 0.75rem;
+        opacity: 0.6;
+        display: flex;
+        gap: 16px;
+        flex-wrap: wrap;
+      }
+      footer.site-footer a {
+        color: inherit;
+      }
+      .drop-overlay {
+        position: fixed;
+        inset: 0;
+        pointer-events: none;
+        background: rgba(56, 120, 200, 0.16);
+        border: 4px dashed rgba(56, 120, 200, 0.6);
+        display: none;
+        align-items: center;
+        justify-content: center;
+        font-size: 1.3rem;
+        font-weight: 600;
+        color: #1f4d8a;
+        z-index: 100;
+        backdrop-filter: blur(1px);
+      }
+      .drop-overlay.active {
+        display: flex;
+      }
+      @media (prefers-color-scheme: dark) {
+        .drop-overlay {
+          color: #9ec0f0;
+          background: rgba(56, 120, 200, 0.22);
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <nav class="site-nav">
+      <a href="/" aria-current="page">Image &amp; GIF</a>
+      <a href="/video.html">Live video</a>
+    </nav>
+    <h1>Image &amp; GIF carve</h1>
+    <p class="lede">
+      Resize images and animated GIFs without squishing the subject. Drop in a
+      GIF, PNG, or JPEG, pick the new width and height as percentages, and hit
+      <em>Carve</em>.
+    </p>
+    <div id="app"></div>
+    <details class="about">
+      <summary>How does it work?</summary>
+      <p>
+        This is a browser implementation of
+        <a href="https://en.wikipedia.org/wiki/Seam_carving" target="_blank" rel="noreferrer noopener">seam carving</a>,
+        a content-aware resizing algorithm. Instead of scaling every pixel
+        uniformly, it repeatedly finds the lowest-energy connected path of
+        pixels (the "seam") and removes it, so busy regions like faces shrink
+        less than flat regions like backgrounds.
+      </p>
+      <p>
+        Animated GIFs use a shared seam set across all frames so the result
+        stays temporally consistent. Tick <em>Scale back to original size</em>
+        to keep the output at the input's dimensions, which acts like a gentle
+        content-aware zoom toward the subject.
+      </p>
+      <p>
+        Carving runs in a Web Worker, so the UI stays responsive while large
+        images are processed.
+      </p>
+    </details>
+    <div id="drop-overlay" class="drop-overlay">Drop image to carve</div>
+    <footer class="site-footer">
+      <span>carve.iios.tv</span>
+      <a href="https://github.com/iios-tv/website" target="_blank" rel="noreferrer noopener">source on GitHub</a>
+    </footer>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

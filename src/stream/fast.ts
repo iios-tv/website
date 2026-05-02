@@ -39,7 +39,13 @@ import type { ImageSize } from '../types';
 //
 // 244 catches everything from fully-transparent through ~95% opaque
 // antialiased halo without false-positives on the opaque subject.
-const ALPHA_DELETE_THRESHOLD = 244;
+export const ALPHA_DELETE_THRESHOLD = 244;
+
+// Sentinel to pass when the caller wants to disable alpha gating entirely
+// (e.g. the UI's "without alpha gating" comparison variant). Any negative
+// threshold works since alpha bytes are always 0..255; -1 is the most
+// readable.
+export const ALPHA_GATING_DISABLED = -1;
 
 // Calibrated so a single delete-pixel outweighs any plausible all-max-energy
 // seam (3 * 255^2 per pixel; longest realistic seam well under 4096).
@@ -56,6 +62,7 @@ export function aggregateEnergyHFlat(
   size: ImageSize,
   energy: Float32Array,
   stride: number,
+  alphaThreshold: number = ALPHA_DELETE_THRESHOLD,
 ): void {
   const { w, h } = size;
   for (let y = 0; y < h; y += 1) {
@@ -70,7 +77,7 @@ export function aggregateEnergyHFlat(
       for (let f = 0; f < frames.length; f += 1) {
         const data = frames[f].data;
         let e: number;
-        if (data[i + 3] <= ALPHA_DELETE_THRESHOLD) {
+        if (data[i + 3] <= alphaThreshold) {
           e = PIXEL_DELETE_ENERGY;
         } else {
           const mr = data[i];
@@ -105,6 +112,7 @@ export function aggregateEnergyVFlat(
   size: ImageSize,
   energy: Float32Array,
   stride: number,
+  alphaThreshold: number = ALPHA_DELETE_THRESHOLD,
 ): void {
   const { w, h } = size;
   const rowBytes = stride * 4;
@@ -117,7 +125,7 @@ export function aggregateEnergyVFlat(
       for (let f = 0; f < frames.length; f += 1) {
         const data = frames[f].data;
         let e: number;
-        if (data[i + 3] <= ALPHA_DELETE_THRESHOLD) {
+        if (data[i + 3] <= alphaThreshold) {
           e = PIXEL_DELETE_ENERGY;
         } else {
           const mr = data[i];
@@ -156,6 +164,7 @@ function recomputeAggregateAtH(
   y: number,
   size: ImageSize,
   stride: number,
+  alphaThreshold: number,
 ): void {
   const { w } = size;
   const i = (y * stride + x) * 4;
@@ -163,7 +172,7 @@ function recomputeAggregateAtH(
   for (let f = 0; f < frames.length; f += 1) {
     const data = frames[f].data;
     let e: number;
-    if (data[i + 3] <= ALPHA_DELETE_THRESHOLD) {
+    if (data[i + 3] <= alphaThreshold) {
       e = PIXEL_DELETE_ENERGY;
     } else {
       const mr = data[i];
@@ -197,6 +206,7 @@ function recomputeAggregateAtV(
   y: number,
   size: ImageSize,
   stride: number,
+  alphaThreshold: number,
 ): void {
   const { h } = size;
   const rowBytes = stride * 4;
@@ -205,7 +215,7 @@ function recomputeAggregateAtV(
   for (let f = 0; f < frames.length; f += 1) {
     const data = frames[f].data;
     let e: number;
-    if (data[i + 3] <= ALPHA_DELETE_THRESHOLD) {
+    if (data[i + 3] <= alphaThreshold) {
       e = PIXEL_DELETE_ENERGY;
     } else {
       const mr = data[i];
@@ -243,12 +253,17 @@ export function refreshEnergyAfterSeamH(
   seamRowX: Int16Array,
   size: ImageSize,
   stride: number,
+  alphaThreshold: number = ALPHA_DELETE_THRESHOLD,
 ): void {
   const { h, w } = size;
   for (let y = 0; y < h; y += 1) {
     const sx = seamRowX[y];
-    if (sx - 1 >= 0) recomputeAggregateAtH(frames, energy, sx - 1, y, size, stride);
-    if (sx < w) recomputeAggregateAtH(frames, energy, sx, y, size, stride);
+    if (sx - 1 >= 0) {
+      recomputeAggregateAtH(frames, energy, sx - 1, y, size, stride, alphaThreshold);
+    }
+    if (sx < w) {
+      recomputeAggregateAtH(frames, energy, sx, y, size, stride, alphaThreshold);
+    }
   }
 }
 
@@ -258,12 +273,17 @@ export function refreshEnergyAfterSeamV(
   seamColY: Int16Array,
   size: ImageSize,
   stride: number,
+  alphaThreshold: number = ALPHA_DELETE_THRESHOLD,
 ): void {
   const { w, h } = size;
   for (let x = 0; x < w; x += 1) {
     const sy = seamColY[x];
-    if (sy - 1 >= 0) recomputeAggregateAtV(frames, energy, x, sy - 1, size, stride);
-    if (sy < h) recomputeAggregateAtV(frames, energy, x, sy, size, stride);
+    if (sy - 1 >= 0) {
+      recomputeAggregateAtV(frames, energy, x, sy - 1, size, stride, alphaThreshold);
+    }
+    if (sy < h) {
+      recomputeAggregateAtV(frames, energy, x, sy, size, stride, alphaThreshold);
+    }
   }
 }
 

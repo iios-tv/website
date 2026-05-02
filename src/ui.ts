@@ -5,10 +5,45 @@ import { extFor, mimeFor, type ImageFormat } from './image';
 const DEFAULT_WIDTH_PCT = 50;
 const DEFAULT_HEIGHT_PCT = 50;
 
+// Each variant is one configuration of carve options that the user can toggle
+// on for a side-by-side comparison. Adding a new comparison axis (e.g. an
+// alternative energy formula) is as simple as appending another entry; the
+// UI grows another checkbox + output card automatically.
+type VariantConfig = {
+  id: string;
+  label: string; // text on the checkbox
+  shortLabel: string; // text in the card title (kept tight to fit the column)
+  alphaAware: boolean;
+  defaultChecked: boolean;
+};
+
+const VARIANTS: VariantConfig[] = [
+  {
+    id: 'alpha-on',
+    label: 'Alpha-aware energy',
+    shortLabel: 'Alpha-aware',
+    alphaAware: true,
+    defaultChecked: true,
+  },
+  {
+    id: 'alpha-off',
+    label: 'No alpha gating',
+    shortLabel: 'No gating',
+    alphaAware: false,
+    defaultChecked: false,
+  },
+];
+
+type VariantOutput = {
+  url: string;
+  result: CarveResult;
+  blob: Blob;
+};
+
 type State = {
   inputBuffer: ArrayBuffer | null;
   inputUrl: string | null;
-  outputUrl: string | null;
+  outputs: Map<string, VariantOutput>;
   inputName: string;
 };
 
@@ -31,23 +66,35 @@ export function mountUi(root: HTMLElement): void {
         <input type="checkbox" id="scale-back" />
         Scale back to original size
       </label>
+    </div>
+    <div class="variants-row">
+      <span class="variants-label" title="Each checked variant produces its own output card so you can compare them side-by-side.">
+        Variants:
+      </span>
+      ${VARIANTS.map(
+        (v) =>
+          `<label title="${variantTooltip(v)}"><input type="checkbox" data-variant="${v.id}" ${v.defaultChecked ? 'checked' : ''} /> ${v.label}</label>`,
+      ).join('')}
       <button id="carve" disabled>Carve</button>
     </div>
     <div class="status" id="status"></div>
-    <div class="preview">
-      <div>
+    <div class="preview" id="preview">
+      <div class="preview-card" data-pane="orig">
         <span class="label" id="orig-label">Original</span>
         <img id="orig" alt="Original image" />
       </div>
-      <div>
-        <div class="label-row">
-          <span class="label" id="out-label">Carved</span>
-          <a id="download" class="download-btn" hidden download>Download</a>
-        </div>
-        <img id="out" alt="Carved image" />
-      </div>
+      ${VARIANTS.map(
+        (v) => `
+        <div class="preview-card" data-pane="${v.id}" hidden>
+          <div class="label-row">
+            <span class="label" data-label="${v.id}">${v.shortLabel}</span>
+            <a class="download-btn" data-download="${v.id}" hidden download>Download</a>
+          </div>
+          <img data-image="${v.id}" alt="Carved image (${v.shortLabel})" />
+          <pre class="timings" data-timings="${v.id}" hidden></pre>
+        </div>`,
+      ).join('')}
     </div>
-    <pre class="timings" id="timings" hidden></pre>
   `;
 
   const fileInput = root.querySelector<HTMLInputElement>('#file')!;
@@ -57,16 +104,15 @@ export function mountUi(root: HTMLElement): void {
   const carveBtn = root.querySelector<HTMLButtonElement>('#carve')!;
   const status = root.querySelector<HTMLDivElement>('#status')!;
   const origImg = root.querySelector<HTMLImageElement>('#orig')!;
-  const outImg = root.querySelector<HTMLImageElement>('#out')!;
   const origLabel = root.querySelector<HTMLSpanElement>('#orig-label')!;
-  const outLabel = root.querySelector<HTMLSpanElement>('#out-label')!;
-  const downloadLink = root.querySelector<HTMLAnchorElement>('#download')!;
-  const timingsEl = root.querySelector<HTMLPreElement>('#timings')!;
+  const variantCheckboxes = Array.from(
+    root.querySelectorAll<HTMLInputElement>('input[data-variant]'),
+  );
 
   const state: State = {
     inputBuffer: null,
     inputUrl: null,
-    outputUrl: null,
+    outputs: new Map(),
     inputName: '',
   };
 
@@ -78,6 +124,25 @@ export function mountUi(root: HTMLElement): void {
     return carveClient;
   }
 
+  function getCheckedVariants(): VariantConfig[] {
+    return VARIANTS.filter(
+      (v) =>
+        root.querySelector<HTMLInputElement>(`input[data-variant="${v.id}"]`)?.checked ?? false,
+    );
+  }
+
+  function refreshCarveButton(): void {
+    const ready = state.inputBuffer !== null;
+    const anyVariant = getCheckedVariants().length > 0;
+    carveBtn.disabled = !(ready && anyVariant);
+  }
+
+  function clearAllOutputs(): void {
+    for (const out of state.outputs.values()) URL.revokeObjectURL(out.url);
+    state.outputs.clear();
+    for (const v of VARIANTS) hideVariantPane(root, v.id);
+  }
+
   async function loadFile(file: File): Promise<void> {
     if (!isSupportedImage(file)) {
       status.textContent = `error: unsupported file (${file.name || 'unknown'}); expected GIF, PNG, or JPEG`;
@@ -85,22 +150,16 @@ export function mountUi(root: HTMLElement): void {
     }
 
     revokeIfSet(state.inputUrl);
-    revokeIfSet(state.outputUrl);
+    clearAllOutputs();
 
     state.inputBuffer = await file.arrayBuffer();
     state.inputUrl = URL.createObjectURL(file);
-    state.outputUrl = null;
     state.inputName = file.name;
 
     origImg.src = state.inputUrl;
-    outImg.removeAttribute('src');
     origLabel.textContent = `Original (${file.name}, ${formatBytes(file.size)})`;
-    outLabel.textContent = 'Carved';
-    downloadLink.hidden = true;
-    downloadLink.removeAttribute('href');
-    timingsEl.hidden = true;
     status.textContent = '';
-    carveBtn.disabled = false;
+    refreshCarveButton();
   }
 
   fileInput.addEventListener('change', async () => {
@@ -110,71 +169,135 @@ export function mountUi(root: HTMLElement): void {
 
   installDropZone(loadFile, status);
 
+  for (const cb of variantCheckboxes) {
+    cb.addEventListener('change', refreshCarveButton);
+  }
+
   carveBtn.addEventListener('click', async () => {
     if (!state.inputBuffer) return;
+    const variants = getCheckedVariants();
+    if (variants.length === 0) {
+      status.textContent = 'pick at least one variant to carve';
+      return;
+    }
 
     const widthPct = clampPct(widthInput.valueAsNumber, DEFAULT_WIDTH_PCT);
     const heightPct = clampPct(heightInput.valueAsNumber, DEFAULT_HEIGHT_PCT);
+    const toWidth = Math.max(1, Math.floor((widthPct * getNaturalWidth(origImg)) / 100));
+    const toHeight = Math.max(1, Math.floor((heightPct * getNaturalHeight(origImg)) / 100));
+    const scaleBack = scaleBackInput.checked;
 
     carveBtn.disabled = true;
-    status.textContent = 'Carving...';
-    timingsEl.hidden = true;
+    clearAllOutputs();
 
     try {
       const client = getCarveClient();
-      const result = await client.carve(
-        state.inputBuffer,
-        {
-          toWidth: Math.max(
-            1,
-            Math.floor((widthPct * /* original width */ getNaturalWidth(origImg)) / 100),
-          ),
-          toHeight: Math.max(
-            1,
-            Math.floor((heightPct * getNaturalHeight(origImg)) / 100),
-          ),
-          scaleBackToOriginal: scaleBackInput.checked,
-        },
-        (info) => {
-          status.textContent = formatProgress(info);
-        },
-      );
+      for (let i = 0; i < variants.length; i += 1) {
+        const variant = variants[i];
+        const prefix =
+          variants.length > 1
+            ? `Variant ${i + 1}/${variants.length} (${variant.shortLabel}): `
+            : '';
+        status.textContent = `${prefix}Carving...`;
 
-      revokeIfSet(state.outputUrl);
+        const result = await client.carve(
+          state.inputBuffer,
+          {
+            toWidth,
+            toHeight,
+            scaleBackToOriginal: scaleBack,
+            alphaAware: variant.alphaAware,
+          },
+          (info) => {
+            status.textContent = `${prefix}${formatProgress(info)}`;
+          },
+        );
 
-      const blob = new Blob([result.bytes as BlobPart], { type: mimeFor(result.format) });
-      state.outputUrl = URL.createObjectURL(blob);
-      outImg.src = state.outputUrl;
-      const carvedDims = `${result.carvedSize.w}x${result.carvedSize.h}`;
-      const outDims = `${result.outputSize.w}x${result.outputSize.h}`;
-      const dimText = result.scaledBack
-        ? `${outDims}, carved to ${carvedDims} then scaled back`
-        : outDims;
-      const fmtTag = result.format.toUpperCase();
-      outLabel.textContent = `Carved ${fmtTag} (${dimText}, ${formatBytes(blob.size)})`;
-      origLabel.textContent = `Original (${state.inputName}, ${result.inputSize.w}x${result.inputSize.h})`;
-
-      downloadLink.href = state.outputUrl;
-      downloadLink.download = makeDownloadName(
-        state.inputName,
-        result.format,
-        result.outputSize.w,
-        result.outputSize.h,
-        result.scaledBack,
-      );
-      downloadLink.hidden = false;
-
-      timingsEl.textContent = formatTimings(result);
-      timingsEl.hidden = false;
+        const blob = new Blob([result.bytes as BlobPart], { type: mimeFor(result.format) });
+        const url = URL.createObjectURL(blob);
+        state.outputs.set(variant.id, { url, result, blob });
+        renderVariantPane(root, variant, url, result, blob, state.inputName);
+      }
       status.textContent = '';
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       status.textContent = `error: ${msg}`;
       console.error(err);
     } finally {
-      carveBtn.disabled = false;
+      refreshCarveButton();
     }
   });
+}
+
+function variantTooltip(v: VariantConfig): string {
+  return v.alphaAware
+    ? 'Pixels with alpha <= 244 get a huge negative energy so transparent halos around stickers/emotes are carved away first. Best for images with a transparent background.'
+    : 'Energy comes from the RGB gradient only; alpha is ignored. Useful for opaque images, or as a comparison baseline against the alpha-aware variant.';
+}
+
+function hideVariantPane(root: HTMLElement, id: string): void {
+  const pane = root.querySelector<HTMLDivElement>(`[data-pane="${id}"]`);
+  if (!pane) return;
+  pane.setAttribute('hidden', '');
+  const img = pane.querySelector<HTMLImageElement>('img');
+  img?.removeAttribute('src');
+  const download = pane.querySelector<HTMLAnchorElement>('.download-btn');
+  if (download) {
+    download.setAttribute('hidden', '');
+    download.removeAttribute('href');
+  }
+  const timings = pane.querySelector<HTMLPreElement>('.timings');
+  if (timings) {
+    timings.setAttribute('hidden', '');
+    timings.textContent = '';
+  }
+}
+
+function renderVariantPane(
+  root: HTMLElement,
+  variant: VariantConfig,
+  url: string,
+  result: CarveResult,
+  blob: Blob,
+  inputName: string,
+): void {
+  const pane = root.querySelector<HTMLDivElement>(`[data-pane="${variant.id}"]`);
+  if (!pane) return;
+  pane.removeAttribute('hidden');
+
+  const img = pane.querySelector<HTMLImageElement>('img');
+  if (img) img.src = url;
+
+  const label = pane.querySelector<HTMLSpanElement>('.label');
+  if (label) {
+    const carvedDims = `${result.carvedSize.w}x${result.carvedSize.h}`;
+    const outDims = `${result.outputSize.w}x${result.outputSize.h}`;
+    const dimText = result.scaledBack
+      ? `${outDims}, carved to ${carvedDims} then scaled back`
+      : outDims;
+    const fmtTag = result.format.toUpperCase();
+    label.textContent = `${variant.shortLabel} - ${fmtTag} (${dimText}, ${formatBytes(blob.size)})`;
+  }
+
+  const download = pane.querySelector<HTMLAnchorElement>('.download-btn');
+  if (download) {
+    download.href = url;
+    download.download = makeDownloadName(
+      inputName,
+      result.format,
+      result.outputSize.w,
+      result.outputSize.h,
+      result.scaledBack,
+      variant.id,
+    );
+    download.removeAttribute('hidden');
+  }
+
+  const timings = pane.querySelector<HTMLPreElement>('.timings');
+  if (timings) {
+    timings.textContent = formatTimings(result);
+    timings.removeAttribute('hidden');
+  }
 }
 
 function clampPct(value: number, fallback: number): number {
@@ -204,9 +327,6 @@ function formatTimings(result: CarveResult): string {
   const t = result.timings;
   const lines = [
     `frames:        ${result.frameCount}`,
-    `input size:    ${result.inputSize.w}x${result.inputSize.h}`,
-    `carved size:   ${result.carvedSize.w}x${result.carvedSize.h}`,
-    `output size:   ${result.outputSize.w}x${result.outputSize.h}${result.scaledBack ? ' (scaled back)' : ''}`,
     `decode:        ${t.decodeMs.toFixed(1)} ms`,
     `width carve:   ${t.widthCarveMs.toFixed(1)} ms`,
     `height carve:  ${t.heightCarveMs.toFixed(1)} ms`,
@@ -217,20 +337,22 @@ function formatTimings(result: CarveResult): string {
   return lines.join('\n');
 }
 
-// Build a "<stem>.carved.WxH[.scaled].<ext>" name from the input filename and
-// output format so downloads land with something identifying.
+// Build a "<stem>.carved.WxH[.scaled].<variant>.<ext>" name from the input
+// filename and output format. Including the variant id keeps multiple
+// variants of the same input from clobbering each other on download.
 function makeDownloadName(
   inputName: string,
   format: ImageFormat,
   w: number,
   h: number,
   scaledBack: boolean,
+  variantId: string,
 ): string {
   const ext = extFor(format);
   const trimmed = (inputName || '').trim();
   const stem = stripKnownExtension(trimmed) || 'output';
-  const tag = scaledBack ? `${w}x${h}.scaled` : `${w}x${h}`;
-  return `${stem}.carved.${tag}.${ext}`;
+  const dimTag = scaledBack ? `${w}x${h}.scaled` : `${w}x${h}`;
+  return `${stem}.carved.${dimTag}.${variantId}.${ext}`;
 }
 
 const KNOWN_EXTENSIONS = ['.gif', '.png', '.jpg', '.jpeg'];

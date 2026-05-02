@@ -51,31 +51,65 @@
       }
       .preview {
         display: grid;
-        grid-template-columns: 1fr 1fr;
+        grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
         gap: 16px;
         align-items: start;
       }
-      .preview > div {
+      .preview-card {
         display: flex;
         flex-direction: column;
         gap: 6px;
+        min-width: 0; /* let the grid track shrink the card */
       }
-      .preview img {
+      .preview-card[hidden] {
+        display: none;
+      }
+      .preview-card img {
         max-width: 100%;
         image-rendering: pixelated;
         background:
           linear-gradient(45deg, #e0e0e0 25%, transparent 25%, transparent 75%, #e0e0e0 75%) 0 0/16px 16px,
           linear-gradient(45deg, #e0e0e0 25%, transparent 25%, transparent 75%, #e0e0e0 75%) 8px 8px/16px 16px;
       }
-      .preview .label {
+      .preview-card .label {
         font-size: 0.8rem;
         opacity: 0.7;
       }
-      .preview .label-row {
+      .preview-card .label-row {
         display: flex;
         align-items: center;
         justify-content: space-between;
         gap: 8px;
+      }
+      .preview-card .timings {
+        margin: 0;
+        padding: 8px 10px;
+        background: rgba(127, 127, 127, 0.12);
+        border-radius: 4px;
+        font-size: 0.75rem;
+        white-space: pre-wrap;
+      }
+      .variants-row {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 12px;
+        align-items: center;
+        margin-bottom: 16px;
+        font-size: 0.85rem;
+      }
+      .variants-row .variants-label {
+        opacity: 0.7;
+      }
+      .variants-row label {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+      }
+      .variants-row button {
+        margin-left: auto;
+        padding: 6px 14px;
+        font-size: 0.9rem;
+        cursor: pointer;
       }
       .download-btn {
         font-size: 0.8rem;
@@ -93,14 +127,6 @@
       }
       .download-btn[hidden] {
         display: none;
-      }
-      pre.timings {
-        margin-top: 16px;
-        padding: 8px 12px;
-        background: rgba(127, 127, 127, 0.12);
-        border-radius: 4px;
-        font-size: 0.8rem;
-        white-space: pre-wrap;
       }
       .status {
         margin-top: 12px;

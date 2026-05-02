@@ -65,6 +65,7 @@ export class CarveWorkerClient {
         toWidth: opts.toWidth,
         toHeight: opts.toHeight,
         scaleBackToOriginal: opts.scaleBackToOriginal,
+        alphaAware: opts.alphaAware,
         jpegQuality: opts.jpegQuality,
       };
 

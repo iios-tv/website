@@ -1,6 +1,8 @@
 import { decodeImage, encodeImage, type ImageFormat } from './image';
 import { scaleAllFrames } from './resize';
 import {
+  ALPHA_DELETE_THRESHOLD,
+  ALPHA_GATING_DISABLED,
   aggregateEnergyHFlat,
   aggregateEnergyVFlat,
   deleteSeamHFromEnergy,
@@ -40,6 +42,12 @@ export type CarveOptions = {
   // but with low-energy regions compressed -- effectively a content-aware
   // zoom toward the high-energy subject.
   scaleBackToOriginal?: boolean;
+  // When true (default), pixels with alpha <= 244 get a huge negative energy
+  // so transparent halos are carved away first. When false, alpha is ignored
+  // and only the RGB gradient drives seam selection -- useful for A/B
+  // comparisons or for opaque inputs where the gating happens to over-protect
+  // a region.
+  alphaAware?: boolean;
   // JPEG-only quality knob (0..1). Ignored for other formats.
   jpegQuality?: number;
   // Optional progress hook, called from inside the carve loop. Useful when
@@ -106,6 +114,12 @@ export async function carveImage(
   const seamRowX = new Int16Array(inputSize.h); // x of seam pixel at each row (H seams)
   const seamColY = new Int16Array(inputSize.w); // y of seam pixel at each column (V seams)
 
+  // alphaAware defaults to true (the better behaviour for transparent emotes
+  // and a no-op on opaque inputs). Pass false to fall back to plain RGB
+  // gradient energy.
+  const alphaAware = opts.alphaAware !== false;
+  const alphaThreshold = alphaAware ? ALPHA_DELETE_THRESHOLD : ALPHA_GATING_DISABLED;
+
   widthPass(
     decoded.frames,
     size,
@@ -115,6 +129,7 @@ export async function carveImage(
     dpEnergy,
     dpPrev,
     seamRowX,
+    alphaThreshold,
     onProgress,
   );
   const tWidth = performance.now();
@@ -128,6 +143,7 @@ export async function carveImage(
     dpEnergy,
     dpPrev,
     seamColY,
+    alphaThreshold,
     onProgress,
   );
   const tHeight = performance.now();
@@ -182,13 +198,14 @@ function widthPass(
   dpEnergy: Float64Array,
   dpPrev: Int8Array,
   seamRowX: Int16Array,
+  alphaThreshold: number,
   onProgress: ProgressCallback,
 ): void {
   const pxToRemove = size.w - toWidth;
   onProgress('width', 0, pxToRemove);
   if (pxToRemove === 0) return;
 
-  aggregateEnergyHFlat(frames, size, energy, stride);
+  aggregateEnergyHFlat(frames, size, energy, stride, alphaThreshold);
 
   for (let i = 0; i < pxToRemove; i += 1) {
     findLowEnergySeamHFlat(energy, size, stride, dpEnergy, dpPrev, seamRowX);
@@ -197,7 +214,7 @@ function widthPass(
     }
     deleteSeamHFromEnergy(energy, seamRowX, size, stride);
     size.w -= 1;
-    refreshEnergyAfterSeamH(frames, energy, seamRowX, size, stride);
+    refreshEnergyAfterSeamH(frames, energy, seamRowX, size, stride, alphaThreshold);
     onProgress('width', i + 1, pxToRemove);
   }
 }
@@ -211,6 +228,7 @@ function heightPass(
   dpEnergy: Float64Array,
   dpPrev: Int8Array,
   seamColY: Int16Array,
+  alphaThreshold: number,
   onProgress: ProgressCallback,
 ): void {
   const pxToRemove = size.h - toHeight;
@@ -220,7 +238,7 @@ function heightPass(
   // The vertical-gradient energy is a different field than the horizontal one
   // we built for the width pass, so we rebuild from scratch (single full pass
   // over the now-smaller frames).
-  aggregateEnergyVFlat(frames, size, energy, stride);
+  aggregateEnergyVFlat(frames, size, energy, stride, alphaThreshold);
 
   for (let i = 0; i < pxToRemove; i += 1) {
     findLowEnergySeamVFlat(energy, size, stride, dpEnergy, dpPrev, seamColY);
@@ -229,7 +247,7 @@ function heightPass(
     }
     deleteSeamVFromEnergy(energy, seamColY, size, stride);
     size.h -= 1;
-    refreshEnergyAfterSeamV(frames, energy, seamColY, size, stride);
+    refreshEnergyAfterSeamV(frames, energy, seamColY, size, stride, alphaThreshold);
     onProgress('height', i + 1, pxToRemove);
   }
 }

@@ -11,6 +11,7 @@ export type CarveRequest = {
   toWidth: number;
   toHeight: number;
   scaleBackToOriginal?: boolean;
+  alphaAware?: boolean;
   jpegQuality?: number;
 };
 

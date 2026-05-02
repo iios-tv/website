@@ -37,6 +37,7 @@ async function handleCarve(req: CarveRequest): Promise<void> {
       toWidth: req.toWidth,
       toHeight: req.toHeight,
       scaleBackToOriginal: req.scaleBackToOriginal,
+      alphaAware: req.alphaAware,
       jpegQuality: req.jpegQuality,
       onProgress,
     });

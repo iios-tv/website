@@ -27,6 +27,25 @@ import type { ImageSize } from '../types';
 //   seamH      Int16Array,   length >= size.h (x at each y)
 //   seamV      Int16Array,   length >= size.w (y at each x)
 
+// --- Alpha-aware energy gating --------------------------------------------
+//
+// Matches js-image-carver's contentAwareResizer.ts. Any pixel whose alpha is
+// at or below ALPHA_DELETE_THRESHOLD gets PIXEL_DELETE_ENERGY (a large
+// negative number) instead of its RGB gradient sum. The DP minimum-path
+// search then always picks transparent regions for removal first, so the
+// transparent halo around a sticker is carved away before subject pixels.
+// Without this, the gradient at the alpha edge actively repels seams from
+// the halo and pushes them through the subject, distorting it.
+//
+// 244 catches everything from fully-transparent through ~95% opaque
+// antialiased halo without false-positives on the opaque subject.
+const ALPHA_DELETE_THRESHOLD = 244;
+
+// Calibrated so a single delete-pixel outweighs any plausible all-max-energy
+// seam (3 * 255^2 per pixel; longest realistic seam well under 4096).
+// Float32-representable; DP cumulatives stay within range.
+const PIXEL_DELETE_ENERGY = -1 * 2 * 2 * 4096 * 3 * 255 * 255;
+
 // --- Aggregate energy (full rebuild, used once per pass) -------------------
 
 // Cross-frame max of horizontal-gradient energy. Writes into `energy` at
@@ -43,32 +62,39 @@ export function aggregateEnergyHFlat(
     const rowEnergy = y * stride;
     const rowData = y * stride * 4;
     for (let x = 0; x < w; x += 1) {
-      energy[rowEnergy + x] = 0;
       const i = rowData + x * 4;
-      let maxE = 0;
+      // Cross-frame max: a position is only "free to remove" if it's
+      // transparent in EVERY frame; an opaque frame's positive gradient
+      // wins the max and the seam correctly avoids it.
+      let maxE = -Infinity;
       for (let f = 0; f < frames.length; f += 1) {
         const data = frames[f].data;
-        const mr = data[i];
-        const mg = data[i + 1];
-        const mb = data[i + 2];
-        let e = 0;
-        if (x > 0) {
-          const il = i - 4;
-          const dr = data[il] - mr;
-          const dg = data[il + 1] - mg;
-          const db = data[il + 2] - mb;
-          e += dr * dr + dg * dg + db * db;
-        }
-        if (x + 1 < w) {
-          const ir = i + 4;
-          const dr = data[ir] - mr;
-          const dg = data[ir + 1] - mg;
-          const db = data[ir + 2] - mb;
-          e += dr * dr + dg * dg + db * db;
+        let e: number;
+        if (data[i + 3] <= ALPHA_DELETE_THRESHOLD) {
+          e = PIXEL_DELETE_ENERGY;
+        } else {
+          const mr = data[i];
+          const mg = data[i + 1];
+          const mb = data[i + 2];
+          e = 0;
+          if (x > 0) {
+            const il = i - 4;
+            const dr = data[il] - mr;
+            const dg = data[il + 1] - mg;
+            const db = data[il + 2] - mb;
+            e += dr * dr + dg * dg + db * db;
+          }
+          if (x + 1 < w) {
+            const ir = i + 4;
+            const dr = data[ir] - mr;
+            const dg = data[ir + 1] - mg;
+            const db = data[ir + 2] - mb;
+            e += dr * dr + dg * dg + db * db;
+          }
         }
         if (e > maxE) maxE = e;
       }
-      energy[rowEnergy + x] = maxE;
+      energy[rowEnergy + x] = maxE === -Infinity ? 0 : maxE;
     }
   }
 }
@@ -87,30 +113,35 @@ export function aggregateEnergyVFlat(
     const rowData = y * rowBytes;
     for (let x = 0; x < w; x += 1) {
       const i = rowData + x * 4;
-      let maxE = 0;
+      let maxE = -Infinity;
       for (let f = 0; f < frames.length; f += 1) {
         const data = frames[f].data;
-        const mr = data[i];
-        const mg = data[i + 1];
-        const mb = data[i + 2];
-        let e = 0;
-        if (y > 0) {
-          const it = i - rowBytes;
-          const dr = data[it] - mr;
-          const dg = data[it + 1] - mg;
-          const db = data[it + 2] - mb;
-          e += dr * dr + dg * dg + db * db;
-        }
-        if (y + 1 < h) {
-          const ib = i + rowBytes;
-          const dr = data[ib] - mr;
-          const dg = data[ib + 1] - mg;
-          const db = data[ib + 2] - mb;
-          e += dr * dr + dg * dg + db * db;
+        let e: number;
+        if (data[i + 3] <= ALPHA_DELETE_THRESHOLD) {
+          e = PIXEL_DELETE_ENERGY;
+        } else {
+          const mr = data[i];
+          const mg = data[i + 1];
+          const mb = data[i + 2];
+          e = 0;
+          if (y > 0) {
+            const it = i - rowBytes;
+            const dr = data[it] - mr;
+            const dg = data[it + 1] - mg;
+            const db = data[it + 2] - mb;
+            e += dr * dr + dg * dg + db * db;
+          }
+          if (y + 1 < h) {
+            const ib = i + rowBytes;
+            const dr = data[ib] - mr;
+            const dg = data[ib + 1] - mg;
+            const db = data[ib + 2] - mb;
+            e += dr * dr + dg * dg + db * db;
+          }
         }
         if (e > maxE) maxE = e;
       }
-      energy[rowEnergy + x] = maxE;
+      energy[rowEnergy + x] = maxE === -Infinity ? 0 : maxE;
     }
   }
 }
@@ -128,30 +159,35 @@ function recomputeAggregateAtH(
 ): void {
   const { w } = size;
   const i = (y * stride + x) * 4;
-  let maxE = 0;
+  let maxE = -Infinity;
   for (let f = 0; f < frames.length; f += 1) {
     const data = frames[f].data;
-    const mr = data[i];
-    const mg = data[i + 1];
-    const mb = data[i + 2];
-    let e = 0;
-    if (x > 0) {
-      const il = i - 4;
-      const dr = data[il] - mr;
-      const dg = data[il + 1] - mg;
-      const db = data[il + 2] - mb;
-      e += dr * dr + dg * dg + db * db;
-    }
-    if (x + 1 < w) {
-      const ir = i + 4;
-      const dr = data[ir] - mr;
-      const dg = data[ir + 1] - mg;
-      const db = data[ir + 2] - mb;
-      e += dr * dr + dg * dg + db * db;
+    let e: number;
+    if (data[i + 3] <= ALPHA_DELETE_THRESHOLD) {
+      e = PIXEL_DELETE_ENERGY;
+    } else {
+      const mr = data[i];
+      const mg = data[i + 1];
+      const mb = data[i + 2];
+      e = 0;
+      if (x > 0) {
+        const il = i - 4;
+        const dr = data[il] - mr;
+        const dg = data[il + 1] - mg;
+        const db = data[il + 2] - mb;
+        e += dr * dr + dg * dg + db * db;
+      }
+      if (x + 1 < w) {
+        const ir = i + 4;
+        const dr = data[ir] - mr;
+        const dg = data[ir + 1] - mg;
+        const db = data[ir + 2] - mb;
+        e += dr * dr + dg * dg + db * db;
+      }
     }
     if (e > maxE) maxE = e;
   }
-  energy[y * stride + x] = maxE;
+  energy[y * stride + x] = maxE === -Infinity ? 0 : maxE;
 }
 
 function recomputeAggregateAtV(
@@ -165,30 +201,35 @@ function recomputeAggregateAtV(
   const { h } = size;
   const rowBytes = stride * 4;
   const i = y * rowBytes + x * 4;
-  let maxE = 0;
+  let maxE = -Infinity;
   for (let f = 0; f < frames.length; f += 1) {
     const data = frames[f].data;
-    const mr = data[i];
-    const mg = data[i + 1];
-    const mb = data[i + 2];
-    let e = 0;
-    if (y > 0) {
-      const it = i - rowBytes;
-      const dr = data[it] - mr;
-      const dg = data[it + 1] - mg;
-      const db = data[it + 2] - mb;
-      e += dr * dr + dg * dg + db * db;
-    }
-    if (y + 1 < h) {
-      const ib = i + rowBytes;
-      const dr = data[ib] - mr;
-      const dg = data[ib + 1] - mg;
-      const db = data[ib + 2] - mb;
-      e += dr * dr + dg * dg + db * db;
+    let e: number;
+    if (data[i + 3] <= ALPHA_DELETE_THRESHOLD) {
+      e = PIXEL_DELETE_ENERGY;
+    } else {
+      const mr = data[i];
+      const mg = data[i + 1];
+      const mb = data[i + 2];
+      e = 0;
+      if (y > 0) {
+        const it = i - rowBytes;
+        const dr = data[it] - mr;
+        const dg = data[it + 1] - mg;
+        const db = data[it + 2] - mb;
+        e += dr * dr + dg * dg + db * db;
+      }
+      if (y + 1 < h) {
+        const ib = i + rowBytes;
+        const dr = data[ib] - mr;
+        const dg = data[ib + 1] - mg;
+        const db = data[ib + 2] - mb;
+        e += dr * dr + dg * dg + db * db;
+      }
     }
     if (e > maxE) maxE = e;
   }
-  energy[y * stride + x] = maxE;
+  energy[y * stride + x] = maxE === -Infinity ? 0 : maxE;
 }
 
 // After deleting an H seam (vertical column from the picture's POV), refresh

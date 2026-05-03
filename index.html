@@ -69,6 +69,11 @@
         flex-direction: column;
         gap: 6px;
         min-width: 0; /* let the grid track shrink the card */
+        /* Center children horizontally; this also cancels the default
+           flex-item stretch so images render at their intrinsic size
+           (capped at the card's width via max-width: 100% below). */
+        align-items: center;
+        text-align: center;
       }
       .preview-card[hidden] {
         display: none;
@@ -102,6 +107,7 @@
         border-radius: 4px;
         font-size: 0.75rem;
         white-space: pre-wrap;
+        text-align: left; /* keep the label/value columns aligned */
       }
       .variants-row {
         display: flex;

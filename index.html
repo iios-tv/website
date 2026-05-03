@@ -51,9 +51,18 @@
       }
       .preview {
         display: grid;
-        grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+        /* Two fixed tracks: input on the left, stacked outputs on the right.
+           The right track is always present (even before carving) so the
+           input's rendered size doesn't shift when variants appear. */
+        grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
         gap: 16px;
         align-items: start;
+      }
+      .preview-outputs {
+        display: flex;
+        flex-direction: column;
+        gap: 16px;
+        min-width: 0;
       }
       .preview-card {
         display: flex;
@@ -63,6 +72,11 @@
       }
       .preview-card[hidden] {
         display: none;
+      }
+      @media (max-width: 600px) {
+        .preview {
+          grid-template-columns: minmax(0, 1fr);
+        }
       }
       .preview-card img {
         max-width: 100%;

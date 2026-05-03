@@ -30,7 +30,7 @@ const VARIANTS: VariantConfig[] = [
     label: 'No alpha gating',
     shortLabel: 'No gating',
     alphaAware: false,
-    defaultChecked: false,
+    defaultChecked: true,
   },
 ];
 
@@ -63,7 +63,7 @@ export function mountUi(root: HTMLElement): void {
         <input type="number" id="height-pct" min="1" max="100" value="${DEFAULT_HEIGHT_PCT}" />
       </label>
       <label title="After carving, bilinear-scale the result back up to the original image dimensions. The output keeps the original size but with low-energy areas compressed -- effectively a content-aware zoom toward the subject.">
-        <input type="checkbox" id="scale-back" />
+        <input type="checkbox" id="scale-back" checked />
         Scale back to original size
       </label>
     </div>
@@ -83,17 +83,19 @@ export function mountUi(root: HTMLElement): void {
         <span class="label" id="orig-label">Original</span>
         <img id="orig" alt="Original image" />
       </div>
-      ${VARIANTS.map(
-        (v) => `
-        <div class="preview-card" data-pane="${v.id}" hidden>
-          <div class="label-row">
-            <span class="label" data-label="${v.id}">${v.shortLabel}</span>
-            <a class="download-btn" data-download="${v.id}" hidden download>Download</a>
-          </div>
-          <img data-image="${v.id}" alt="Carved image (${v.shortLabel})" />
-          <pre class="timings" data-timings="${v.id}" hidden></pre>
-        </div>`,
-      ).join('')}
+      <div class="preview-outputs">
+        ${VARIANTS.map(
+          (v) => `
+          <div class="preview-card" data-pane="${v.id}" hidden>
+            <div class="label-row">
+              <span class="label" data-label="${v.id}">${v.shortLabel}</span>
+              <a class="download-btn" data-download="${v.id}" hidden download>Download</a>
+            </div>
+            <img data-image="${v.id}" alt="Carved image (${v.shortLabel})" />
+            <pre class="timings" data-timings="${v.id}" hidden></pre>
+          </div>`,
+        ).join('')}
+      </div>
     </div>
   `;
 

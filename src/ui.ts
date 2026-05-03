@@ -238,20 +238,22 @@ export function mountUi(root: HTMLElement): void {
 // every variant has rendered, restart all animations together so they
 // remain visually synced for side-by-side comparison.
 //
-// We do this in two passes:
-//   1. Off-DOM Image.decode() of every blob URL. The original was loaded
-//      on upload so its first frame is already decoded in the cache, but
-//      the carved variants are fresh blobs the browser hasn't seen, and
-//      without a warmup their first frame appears tens of ms after the
-//      original's -- enough that the original has already advanced a
-//      frame or two by the time the variants catch up.
-//   2. Clear src on every visible <img>, wait one animation frame, then
-//      re-assign all srcs in a single synchronous loop. With every blob
-//      already decoded, the browser displays frame 0 of all of them on
-//      the same paint, and they then advance in lockstep (the GIF
-//      decoder/encoder preserves per-frame delays).
+// Naively clearing and re-assigning the same blob URL doesn't reliably
+// reset GIF playback: Chromium keeps the decoded image (and its current
+// frame index) cached against the URL, so re-attaching the same URL
+// resumes mid-animation rather than restarting at frame 0. Instead we
+// mint a *fresh* object URL from the same Blob/buffer for each <img> --
+// the browser sees a never-before-seen URL, spins up a new decoder, and
+// the animation truly restarts. We then update the visible <img>s in
+// lockstep on the next animation frame so all decoders display frame 0
+// on the same paint, after which they advance together because the GIF
+// decoder/encoder preserves per-frame delays.
 //
-// Skipped for non-animated inputs to avoid a spurious flicker.
+// Pre-decoding via off-DOM Image.decode() before the swap removes any
+// per-image decode-latency variance that would otherwise show up as
+// sub-frame jitter at startup.
+//
+// Skipped for non-animated inputs (no temporal axis, nothing to sync).
 async function syncAnimatedPlayback(
   root: HTMLElement,
   origImg: HTMLImageElement,
@@ -262,29 +264,69 @@ async function syncAnimatedPlayback(
   );
   if (!animated) return;
 
-  const items: { img: HTMLImageElement; url: string }[] = [];
-  if (state.inputUrl) items.push({ img: origImg, url: state.inputUrl });
+  type Item =
+    | { kind: 'orig'; img: HTMLImageElement; prevUrl: string; freshUrl: string }
+    | {
+        kind: 'variant';
+        img: HTMLImageElement;
+        prevUrl: string;
+        freshUrl: string;
+        variantId: string;
+      };
+
+  const items: Item[] = [];
+  if (state.inputBuffer && state.inputUrl) {
+    const fresh = URL.createObjectURL(new Blob([state.inputBuffer as BlobPart]));
+    items.push({ kind: 'orig', img: origImg, prevUrl: state.inputUrl, freshUrl: fresh });
+  }
   for (const v of VARIANTS) {
     const out = state.outputs.get(v.id);
     if (!out) continue;
     const img = root.querySelector<HTMLImageElement>(`[data-image="${v.id}"]`);
-    if (img) items.push({ img, url: out.url });
+    if (!img) continue;
+    items.push({
+      kind: 'variant',
+      img,
+      prevUrl: out.url,
+      freshUrl: URL.createObjectURL(out.blob),
+      variantId: v.id,
+    });
   }
   if (items.length === 0) return;
 
   await Promise.all(
-    items.map(({ url }) => {
+    items.map(({ freshUrl }) => {
       const warm = new Image();
-      warm.src = url;
+      warm.src = freshUrl;
       return warm.decode().catch(() => {
         /* a failed warmup is fine; the visible <img> will retry */
       });
     }),
   );
 
-  for (const { img } of items) img.removeAttribute('src');
   await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
-  for (const { img, url } of items) img.src = url;
+  for (const { img, freshUrl } of items) img.src = freshUrl;
+
+  // Variant Download anchors point at the previous URL via renderVariantPane;
+  // repoint them at the fresh URL before we revoke the old one below so the
+  // download keeps working.
+  for (const item of items) {
+    if (item.kind !== 'variant') continue;
+    const dl = root.querySelector<HTMLAnchorElement>(
+      `a[data-download="${item.variantId}"]`,
+    );
+    if (dl) dl.href = item.freshUrl;
+  }
+
+  for (const item of items) {
+    if (item.kind === 'orig') {
+      state.inputUrl = item.freshUrl;
+    } else {
+      const out = state.outputs.get(item.variantId);
+      if (out) out.url = item.freshUrl;
+    }
+    URL.revokeObjectURL(item.prevUrl);
+  }
 }
 
 function variantTooltip(v: VariantConfig): string {

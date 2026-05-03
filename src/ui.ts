@@ -221,7 +221,7 @@ export function mountUi(root: HTMLElement): void {
         renderVariantPane(root, variant, url, result, blob, state.inputName);
       }
       status.textContent = '';
-      syncAnimatedPlayback(root, origImg, state);
+      await syncAnimatedPlayback(root, origImg, state);
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       status.textContent = `error: ${msg}`;
@@ -234,16 +234,29 @@ export function mountUi(root: HTMLElement): void {
 
 // Animated GIFs in <img> tags start playing as soon as their src is set,
 // so the original (loaded on upload) and the carved variants (set later,
-// at staggered times as each variant finishes) drift out of phase. Once
-// every variant has rendered we clear and re-assign src on all of them
-// in a single microtask, which forces every animation to restart from
-// frame 0 essentially simultaneously and stay visually synced thereafter.
-// Skipped for non-animated inputs to avoid a pointless flicker.
-function syncAnimatedPlayback(
+// at staggered times as each variant finishes) drift out of phase. After
+// every variant has rendered, restart all animations together so they
+// remain visually synced for side-by-side comparison.
+//
+// We do this in two passes:
+//   1. Off-DOM Image.decode() of every blob URL. The original was loaded
+//      on upload so its first frame is already decoded in the cache, but
+//      the carved variants are fresh blobs the browser hasn't seen, and
+//      without a warmup their first frame appears tens of ms after the
+//      original's -- enough that the original has already advanced a
+//      frame or two by the time the variants catch up.
+//   2. Clear src on every visible <img>, wait one animation frame, then
+//      re-assign all srcs in a single synchronous loop. With every blob
+//      already decoded, the browser displays frame 0 of all of them on
+//      the same paint, and they then advance in lockstep (the GIF
+//      decoder/encoder preserves per-frame delays).
+//
+// Skipped for non-animated inputs to avoid a spurious flicker.
+async function syncAnimatedPlayback(
   root: HTMLElement,
   origImg: HTMLImageElement,
   state: State,
-): void {
+): Promise<void> {
   const animated = Array.from(state.outputs.values()).some(
     (o) => o.result.frameCount > 1,
   );
@@ -259,10 +272,19 @@ function syncAnimatedPlayback(
   }
   if (items.length === 0) return;
 
+  await Promise.all(
+    items.map(({ url }) => {
+      const warm = new Image();
+      warm.src = url;
+      return warm.decode().catch(() => {
+        /* a failed warmup is fine; the visible <img> will retry */
+      });
+    }),
+  );
+
   for (const { img } of items) img.removeAttribute('src');
-  Promise.resolve().then(() => {
-    for (const { img, url } of items) img.src = url;
-  });
+  await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+  for (const { img, url } of items) img.src = url;
 }
 
 function variantTooltip(v: VariantConfig): string {

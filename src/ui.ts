@@ -221,6 +221,7 @@ export function mountUi(root: HTMLElement): void {
         renderVariantPane(root, variant, url, result, blob, state.inputName);
       }
       status.textContent = '';
+      syncAnimatedPlayback(root, origImg, state);
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       status.textContent = `error: ${msg}`;
@@ -228,6 +229,39 @@ export function mountUi(root: HTMLElement): void {
     } finally {
       refreshCarveButton();
     }
+  });
+}
+
+// Animated GIFs in <img> tags start playing as soon as their src is set,
+// so the original (loaded on upload) and the carved variants (set later,
+// at staggered times as each variant finishes) drift out of phase. Once
+// every variant has rendered we clear and re-assign src on all of them
+// in a single microtask, which forces every animation to restart from
+// frame 0 essentially simultaneously and stay visually synced thereafter.
+// Skipped for non-animated inputs to avoid a pointless flicker.
+function syncAnimatedPlayback(
+  root: HTMLElement,
+  origImg: HTMLImageElement,
+  state: State,
+): void {
+  const animated = Array.from(state.outputs.values()).some(
+    (o) => o.result.frameCount > 1,
+  );
+  if (!animated) return;
+
+  const items: { img: HTMLImageElement; url: string }[] = [];
+  if (state.inputUrl) items.push({ img: origImg, url: state.inputUrl });
+  for (const v of VARIANTS) {
+    const out = state.outputs.get(v.id);
+    if (!out) continue;
+    const img = root.querySelector<HTMLImageElement>(`[data-image="${v.id}"]`);
+    if (img) items.push({ img, url: out.url });
+  }
+  if (items.length === 0) return;
+
+  for (const { img } of items) img.removeAttribute('src');
+  Promise.resolve().then(() => {
+    for (const { img, url } of items) img.src = url;
   });
 }
 

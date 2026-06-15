@@ -61,3 +61,112 @@ export function applyMask(src: ImageData, mask: SeamMask, dst: ImageData): void 
 export function maskGeometryChanged(a: SeamMask, b: SeamMask): boolean {
   return a.outW !== b.outW || a.outH !== b.outH || a.inW !== b.inW || a.inH !== b.inH;
 }
+
+// Nearest-neighbour downscale into a pre-allocated destination ImageData.
+//
+// Used by the refine worker to run carving at a smaller "refine" grid than
+// the full crop, dropping the carve loop's per-cycle work roughly 4x at
+// REFINE_SCALE = 0.5. Center-pixel sampling (the +0.5 in the index math)
+// keeps the sampled pixels centered in each source block rather than
+// biased to the top-left, which is barely more code and noticeably less
+// jittery on motion.
+//
+// Quality is "good enough for gradient topology": seam carving only needs
+// to know where edges live, not their photographic fidelity. A 2x2 box
+// average would be marginally smoother but the difference is invisible
+// on camera footage at the resolutions we care about.
+export function downscaleFrame(src: ImageData, dst: ImageData): void {
+  const srcData = src.data;
+  const dstData = dst.data;
+  const srcW = src.width;
+  const srcH = src.height;
+  const dstW = dst.width;
+  const dstH = dst.height;
+  const srcStride = srcW * 4;
+  for (let dy = 0; dy < dstH; dy += 1) {
+    const sy = Math.min(srcH - 1, Math.floor(((dy + 0.5) * srcH) / dstH));
+    const srcRowBase = sy * srcStride;
+    const dstRowBase = dy * dstW * 4;
+    for (let dx = 0; dx < dstW; dx += 1) {
+      const sx = Math.min(srcW - 1, Math.floor(((dx + 0.5) * srcW) / dstW));
+      const si = srcRowBase + sx * 4;
+      const di = dstRowBase + dx * 4;
+      dstData[di + 0] = srcData[si + 0];
+      dstData[di + 1] = srcData[si + 1];
+      dstData[di + 2] = srcData[si + 2];
+      dstData[di + 3] = srcData[si + 3];
+    }
+  }
+}
+
+// Upscale a refine-resolution SeamMask to full crop resolution.
+//
+// `refineMask.sourceX/sourceY` index into a refine-res frame (refineMask.inW
+// x refineMask.inH). The main thread holds the full-res cropped frame and
+// wants source coords in the full-res space (fullInW x fullInH). The
+// returned mask has the requested full geometry and source coords in the
+// full-res space, so the main thread's `applyMask` works without knowing
+// the worker downsampled internally.
+//
+// Mapping for each full output pixel (fx, fy):
+//   1. Find which refine cell it belongs to: (rx, ry) = floor of
+//      (fx * refineOutW / fullOutW, fy * refineOutH / fullOutH).
+//   2. Look up the refine source coord (refSx, refSy) for that cell.
+//   3. Map back to full-res source: each refine source pixel covers a
+//      ~(fullInW / refineInW) x (fullInH / refineInH) block; pick the
+//      sub-pixel position within that block that mirrors fx/fy's offset
+//      inside its refine output cell. Adjacent full output pixels in the
+//      same refine cell pick adjacent full source pixels, preserving the
+//      full-res detail of the cropped frame.
+//
+// Allocates fresh Int16Arrays for the source coords -- the worker
+// transfers them to the main thread, so reuse is impossible anyway.
+export function upscaleMask(
+  refineMask: SeamMask,
+  fullInW: number,
+  fullInH: number,
+  fullOutW: number,
+  fullOutH: number,
+): SeamMask {
+  const { inW: rInW, inH: rInH, outW: rOutW, outH: rOutH, sourceX: rSx, sourceY: rSy } = refineMask;
+
+  const inScaleX = fullInW / rInW;
+  const inScaleY = fullInH / rInH;
+  const outScaleX = fullOutW / rOutW;
+  const outScaleY = fullOutH / rOutH;
+
+  const sourceX = new Int16Array(fullOutW * fullOutH);
+  const sourceY = new Int16Array(fullOutW * fullOutH);
+
+  for (let fy = 0; fy < fullOutH; fy += 1) {
+    const ry = Math.min(rOutH - 1, Math.floor(fy / outScaleY));
+    const subY = fy - ry * outScaleY;
+    const rRowBase = ry * rOutW;
+    const fRowBase = fy * fullOutW;
+    for (let fx = 0; fx < fullOutW; fx += 1) {
+      const rx = Math.min(rOutW - 1, Math.floor(fx / outScaleX));
+      const subX = fx - rx * outScaleX;
+      const rIdx = rRowBase + rx;
+      const fullSx = Math.min(
+        fullInW - 1,
+        Math.max(0, Math.round(rSx[rIdx] * inScaleX + subX)),
+      );
+      const fullSy = Math.min(
+        fullInH - 1,
+        Math.max(0, Math.round(rSy[rIdx] * inScaleY + subY)),
+      );
+      sourceX[fRowBase + fx] = fullSx;
+      sourceY[fRowBase + fx] = fullSy;
+    }
+  }
+
+  return {
+    inW: fullInW,
+    inH: fullInH,
+    outW: fullOutW,
+    outH: fullOutH,
+    sourceX,
+    sourceY,
+    generation: refineMask.generation,
+  };
+}

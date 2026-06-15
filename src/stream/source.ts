@@ -1,15 +1,32 @@
 // Camera capture wrapped to produce ImageData on demand.
 //
-// Uses an OffscreenCanvas as a hidden render target so we can pull pixels
-// without paying for DOM compositing. `willReadFrequently: true` hints the
-// 2D context to keep its backing store in CPU-readable memory.
+// Uses OffscreenCanvas backing stores so we can pull pixels without paying
+// for DOM compositing. `willReadFrequently: true` hints the 2D context to
+// keep its backing store in CPU-readable memory.
+//
+// Two capture paths:
+//   * `captureFrame()` blits the entire video into a full-frame canvas and
+//     reads it back. Used when callers need the full camera image (e.g.
+//     painting a preview canvas). Cost scales with full-frame area.
+//   * `captureCropped(crop)` blits only the crop rectangle into a small
+//     canvas sized to the crop, and reads back only crop-size pixels. At
+//     640x480 camera + 320x240 crop this is ~4x cheaper than capturing
+//     the full frame then cropping in JS.
+
+import type { CropRegion } from './crop';
 
 export type FrameSource = {
   width: number;
   height: number;
-  // Every call returns a fresh ImageData -- callers may keep it / transfer
-  // its buffer freely without affecting subsequent captures.
+  // Underlying <video> element. Exposed so the UI can use it directly as
+  // a live preview (browser GPU-composites the camera with zero main-
+  // thread work) instead of repainting a canvas every RAF.
+  video: HTMLVideoElement;
+  // Returns a fresh full-frame ImageData. Caller may keep / transfer it.
   captureFrame: () => ImageData;
+  // Returns a fresh ImageData containing just the crop region, sized
+  // (crop.w x crop.h). Caller may keep / transfer it.
+  captureCropped: (crop: CropRegion) => ImageData;
   stop: () => void;
 };
 
@@ -48,18 +65,42 @@ export async function startCamera(opts: CameraOptions = {}): Promise<FrameSource
   const width = video.videoWidth;
   const height = video.videoHeight;
 
-  const canvas = new OffscreenCanvas(width, height);
-  const ctx = canvas.getContext('2d', { willReadFrequently: true });
-  if (!ctx) {
+  const fullCanvas = new OffscreenCanvas(width, height);
+  const fullCtx = fullCanvas.getContext('2d', { willReadFrequently: true });
+  if (!fullCtx) {
     throw new Error('failed to acquire 2D context for camera capture');
   }
+
+  // Separate canvas for the cropped path -- resized lazily to whatever
+  // crop dimensions the caller passes. Most users keep the crop the same
+  // for long stretches, so resizing is rare.
+  const cropCanvas = new OffscreenCanvas(1, 1);
+  const cropCtx = cropCanvas.getContext('2d', { willReadFrequently: true });
+  if (!cropCtx) {
+    throw new Error('failed to acquire 2D context for cropped camera capture');
+  }
+  let cropCanvasW = 0;
+  let cropCanvasH = 0;
 
   return {
     width,
     height,
+    video,
     captureFrame: () => {
-      ctx.drawImage(video, 0, 0, width, height);
-      return ctx.getImageData(0, 0, width, height);
+      fullCtx.drawImage(video, 0, 0, width, height);
+      return fullCtx.getImageData(0, 0, width, height);
+    },
+    captureCropped: (crop) => {
+      const cw = Math.max(1, Math.floor(crop.w));
+      const ch = Math.max(1, Math.floor(crop.h));
+      if (cw !== cropCanvasW || ch !== cropCanvasH) {
+        cropCanvas.width = cw;
+        cropCanvas.height = ch;
+        cropCanvasW = cw;
+        cropCanvasH = ch;
+      }
+      cropCtx.drawImage(video, crop.x, crop.y, cw, ch, 0, 0, cw, ch);
+      return cropCtx.getImageData(0, 0, cw, ch);
     },
     stop: () => {
       stream.getTracks().forEach((t) => t.stop());

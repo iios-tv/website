@@ -4,20 +4,22 @@ import {
   identityMask,
   type SeamMask,
 } from './stream/mask';
-import { clampCrop, cropImageData, type CropRegion } from './stream/crop';
+import { clampCrop, type CropRegion } from './stream/crop';
 import type { MaskPayload } from './stream/refine.worker';
-import { scaleFrame } from './resize';
 
 const DEFAULT_WIDTH_PCT = 50;
 const DEFAULT_HEIGHT_PCT = 50;
 const DEFAULT_RES_HINT = 640;
-const DEFAULT_WINDOW = 8;
+// EMA blend factor. Higher follows motion faster (less catch-up lag) at
+// the cost of more flicker. ~0.25 = ~4-frame half-life, a comfortable
+// default on camera footage.
+const DEFAULT_ALPHA = 0.25;
 const DEFAULT_CROP_W = 320;
 const DEFAULT_CROP_H = 240;
 
-// Throttle main->worker frame sends. Worker only consumes one frame per
-// refine cycle anyway; the ring buffer drops the rest. Limiting outbound
-// rate avoids piling up postMessage traffic.
+// Throttle main->worker frame sends. The worker only consumes one frame
+// per refine cycle anyway; dropping the rest keeps postMessage traffic
+// proportional to refine rate rather than render rate.
 const FRAME_SEND_INTERVAL_MS = 50;
 
 type Mode = 'idle' | 'starting' | 'live' | 'error';
@@ -27,10 +29,11 @@ type LiveCtx = {
   worker: Worker;
   mask: SeamMask;
   carvedFrame: ImageData;
-  croppedFrame: ImageData;
   renderFrames: number;
   workerMasks: number;
   lastRefineMs: number;
+  lastRefineScale: number;
+  lastAlpha: number;
   lastFrameSentAt: number;
   rafHandle: number | null;
   statsHandle: number | null;
@@ -78,11 +81,11 @@ export function mountVideoUi(root: HTMLElement): void {
         Height %
         <input type="number" id="height-pct" min="1" max="100" value="${DEFAULT_HEIGHT_PCT}" />
       </label>
-      <label title="How many recent frames the worker aggregates energy across. Larger window = more temporal coherence, slower refine.">
-        Window
-        <input type="number" id="window" min="1" max="32" value="${DEFAULT_WINDOW}" />
+      <label title="How fast the carve follows subject motion. Lower = smoother but slower to catch up; higher = snaps to motion sooner with more flicker.">
+        Responsiveness
+        <input type="number" id="alpha" min="0.05" max="1" step="0.05" value="${DEFAULT_ALPHA}" />
       </label>
-      <label title="After carving, bilinear-scale each frame back up to the crop dimensions. Output keeps original size with low-energy areas compressed.">
+      <label title="After carving, display each frame stretched back to the crop dimensions (browser CSS scaling). Output keeps original size with low-energy areas compressed.">
         <input type="checkbox" id="scale-back" />
         Scale back to crop size
       </label>
@@ -94,7 +97,6 @@ export function mountVideoUi(root: HTMLElement): void {
       <div>
         <span class="label" id="orig-label">Camera (idle)</span>
         <div class="camera-stage" id="stage">
-          <canvas id="orig"></canvas>
           <div class="crop-overlay hidden" id="crop-overlay"></div>
         </div>
       </div>
@@ -109,14 +111,14 @@ export function mountVideoUi(root: HTMLElement): void {
   const widthInput = root.querySelector<HTMLInputElement>('#width-pct')!;
   const heightInput = root.querySelector<HTMLInputElement>('#height-pct')!;
   const resInput = root.querySelector<HTMLSelectElement>('#res-hint')!;
-  const windowInput = root.querySelector<HTMLInputElement>('#window')!;
+  const alphaInput = root.querySelector<HTMLInputElement>('#alpha')!;
   const cropWInput = root.querySelector<HTMLInputElement>('#crop-w')!;
   const cropHInput = root.querySelector<HTMLInputElement>('#crop-h')!;
   const scaleBackInput = root.querySelector<HTMLInputElement>('#scale-back')!;
   const applyBtn = root.querySelector<HTMLButtonElement>('#apply')!;
   const startBtn = root.querySelector<HTMLButtonElement>('#start')!;
   const status = root.querySelector<HTMLDivElement>('#status')!;
-  const origCanvas = root.querySelector<HTMLCanvasElement>('#orig')!;
+  const stage = root.querySelector<HTMLDivElement>('#stage')!;
   const outCanvas = root.querySelector<HTMLCanvasElement>('#out')!;
   const origLabel = root.querySelector<HTMLSpanElement>('#orig-label')!;
   const outLabel = root.querySelector<HTMLSpanElement>('#out-label')!;
@@ -132,6 +134,9 @@ export function mountVideoUi(root: HTMLElement): void {
     h: DEFAULT_CROP_H,
   };
   let drag: DragState | null = null;
+  // The live <video> element mounted in #stage. Tracked so we can remove
+  // it on teardown / camera restart.
+  let mountedVideo: HTMLVideoElement | null = null;
 
   function setMode(next: Mode): void {
     mode = next;
@@ -140,8 +145,8 @@ export function mountVideoUi(root: HTMLElement): void {
   }
 
   // Position the crop overlay using percentages relative to the stage. The
-  // stage sizes itself to the canvas's display rect, so percentages auto-
-  // adjust if the camera canvas gets CSS-scaled to fit the column.
+  // stage sizes itself to the video's display rect, so percentages auto-
+  // adjust if the camera element gets CSS-scaled to fit the column.
   function paintOverlay(): void {
     if (!live) {
       cropOverlay.classList.add('hidden');
@@ -155,13 +160,13 @@ export function mountVideoUi(root: HTMLElement): void {
     cropOverlay.style.height = `${(crop.h / srcH) * 100}%`;
   }
 
-  function updateCarvedTarget(): { outW: number; outH: number; windowSize: number } {
+  function updateCarvedTarget(): { outW: number; outH: number; alpha: number } {
     const widthPct = clampPct(widthInput.valueAsNumber, DEFAULT_WIDTH_PCT);
     const heightPct = clampPct(heightInput.valueAsNumber, DEFAULT_HEIGHT_PCT);
     const outW = Math.max(1, Math.floor((crop.w * widthPct) / 100));
     const outH = Math.max(1, Math.floor((crop.h * heightPct) / 100));
-    const windowSize = clampInt(windowInput.valueAsNumber, 1, 32, DEFAULT_WINDOW);
-    return { outW, outH, windowSize };
+    const alpha = clampAlpha(alphaInput.valueAsNumber);
+    return { outW, outH, alpha };
   }
 
   function updateOutLabel(): void {
@@ -184,6 +189,24 @@ export function mountVideoUi(root: HTMLElement): void {
       `crop ${crop.w}x${crop.h} @ (${crop.x}, ${crop.y})`;
   }
 
+  // CSS-scale the output canvas back to crop size when "scale back" is on.
+  // The backing store stays at the carved dims (cheap to redraw); the
+  // browser handles the upscale at composite time. Free on opaque camera
+  // footage since browser bilinear matches premultiplied bilinear when
+  // alpha is uniform.
+  function applyOutCanvasDisplay(): void {
+    if (!live) return;
+    if (scaleBackInput.checked) {
+      outCanvas.style.width = `${crop.w}px`;
+      outCanvas.style.height = `${crop.h}px`;
+      outCanvas.classList.add('scale-back');
+    } else {
+      outCanvas.style.width = '';
+      outCanvas.style.height = '';
+      outCanvas.classList.remove('scale-back');
+    }
+  }
+
   cropWInput.addEventListener('change', () => {
     crop.w = clampInt(cropWInput.valueAsNumber, 32, 1920, DEFAULT_CROP_W);
     if (live) crop = clampCrop(crop, { w: live.source.width, h: live.source.height });
@@ -200,11 +223,11 @@ export function mountVideoUi(root: HTMLElement): void {
   });
 
   cropOverlay.addEventListener('pointerdown', (e) => {
-    if (!live) return;
+    if (!live || !mountedVideo) return;
     e.preventDefault();
     cropOverlay.setPointerCapture(e.pointerId);
     cropOverlay.classList.add('dragging');
-    const rect = origCanvas.getBoundingClientRect();
+    const rect = mountedVideo.getBoundingClientRect();
     drag = {
       pointerId: e.pointerId,
       startClientX: e.clientX,
@@ -269,7 +292,7 @@ export function mountVideoUi(root: HTMLElement): void {
       cropWInput.value = String(crop.w);
       cropHInput.value = String(crop.h);
 
-      const { outW, outH, windowSize } = updateCarvedTarget();
+      const { outW, outH, alpha } = updateCarvedTarget();
 
       const worker = new Worker(
         new URL('./stream/refine.worker.ts', import.meta.url),
@@ -281,10 +304,11 @@ export function mountVideoUi(root: HTMLElement): void {
         worker,
         mask: identityMask(crop.w, crop.h, 0),
         carvedFrame: new ImageData(outW, outH),
-        croppedFrame: new ImageData(crop.w, crop.h),
         renderFrames: 0,
         workerMasks: 0,
         lastRefineMs: 0,
+        lastRefineScale: 0,
+        lastAlpha: alpha,
         lastFrameSentAt: 0,
         rafHandle: null,
         statsHandle: null,
@@ -309,6 +333,8 @@ export function mountVideoUi(root: HTMLElement): void {
         };
         live.workerMasks += 1;
         live.lastRefineMs = m.refineMs;
+        live.lastRefineScale = m.refineScale;
+        live.lastAlpha = m.alpha;
         if (live.carvedFrame.width !== m.outW || live.carvedFrame.height !== m.outH) {
           live.carvedFrame = new ImageData(m.outW, m.outH);
         }
@@ -325,13 +351,16 @@ export function mountVideoUi(root: HTMLElement): void {
         inH: crop.h,
         outW,
         outH,
-        windowSize,
+        alpha,
       });
 
-      origCanvas.width = source.width;
-      origCanvas.height = source.height;
-      outCanvas.width = scaleBackInput.checked ? crop.w : outW;
-      outCanvas.height = scaleBackInput.checked ? crop.h : outH;
+      // Mount the live <video> element where the placeholder canvas used
+      // to live. Browser GPU-composites the camera; no main-thread paint.
+      mountVideo(source.video);
+
+      outCanvas.width = outW;
+      outCanvas.height = outH;
+      applyOutCanvasDisplay();
 
       paintOverlay();
       updateOrigLabel();
@@ -356,11 +385,11 @@ export function mountVideoUi(root: HTMLElement): void {
     cropHInput.value = String(crop.h);
     paintOverlay();
 
-    const { outW, outH, windowSize } = updateCarvedTarget();
+    const { outW, outH, alpha } = updateCarvedTarget();
 
-    live.croppedFrame = new ImageData(crop.w, crop.h);
     live.carvedFrame = new ImageData(outW, outH);
     live.mask = identityMask(crop.w, crop.h, live.mask.generation);
+    live.lastAlpha = alpha;
 
     live.worker.postMessage({
       type: 'init',
@@ -368,45 +397,56 @@ export function mountVideoUi(root: HTMLElement): void {
       inH: crop.h,
       outW,
       outH,
-      windowSize,
+      alpha,
     });
 
-    outCanvas.width = scaleBackInput.checked ? crop.w : outW;
-    outCanvas.height = scaleBackInput.checked ? crop.h : outH;
+    outCanvas.width = outW;
+    outCanvas.height = outH;
+    applyOutCanvasDisplay();
     updateOrigLabel();
     updateOutLabel();
   });
 
   scaleBackInput.addEventListener('change', () => {
     if (!live) return;
-    outCanvas.width = scaleBackInput.checked ? crop.w : live.mask.outW;
-    outCanvas.height = scaleBackInput.checked ? crop.h : live.mask.outH;
+    applyOutCanvasDisplay();
     updateOutLabel();
   });
 
+  function mountVideo(video: HTMLVideoElement): void {
+    if (mountedVideo && mountedVideo.parentElement === stage) {
+      stage.removeChild(mountedVideo);
+    }
+    // Insert the live preview before the crop overlay so the overlay
+    // stays on top.
+    stage.insertBefore(video, cropOverlay);
+    mountedVideo = video;
+  }
+
+  function unmountVideo(): void {
+    if (mountedVideo && mountedVideo.parentElement === stage) {
+      stage.removeChild(mountedVideo);
+    }
+    mountedVideo = null;
+  }
+
   function startRenderLoop(): void {
     if (!live) return;
-    const origCtx = origCanvas.getContext('2d')!;
     const outCtx = outCanvas.getContext('2d')!;
 
     const tick = (): void => {
       if (!live || mode !== 'live') return;
       const ctx = live;
 
-      const frame = ctx.source.captureFrame();
-      origCtx.putImageData(frame, 0, 0);
+      // captureCropped reads back only the crop rectangle (much cheaper
+      // than full-frame getImageData + JS crop). Returns a fresh
+      // ImageData; safe to transfer below.
+      const cropped = ctx.source.captureCropped(crop);
 
-      // Crop to the user-positioned region. Reuse the cropped buffer to avoid
-      // per-frame allocation; cropImageData detects geometry mismatches and
-      // allocates fresh if needed.
-      if (ctx.croppedFrame.width !== crop.w || ctx.croppedFrame.height !== crop.h) {
-        ctx.croppedFrame = new ImageData(crop.w, crop.h);
-      }
-      const cropped = cropImageData(frame, crop, ctx.croppedFrame);
-
-      // Only apply the mask if its input geometry matches the current crop.
-      // Mismatch happens transiently right after Apply (worker hasn't posted
-      // a fresh mask yet) -- skipping render then keeps stale frames out.
+      // Only apply the mask if its input geometry matches the current
+      // crop. Mismatch happens transiently right after Apply (worker
+      // hasn't posted a fresh mask yet) -- skipping the render in that
+      // window keeps stale frames out.
       if (ctx.mask.inW === crop.w && ctx.mask.inH === crop.h) {
         if (
           ctx.carvedFrame.width !== ctx.mask.outW ||
@@ -416,43 +456,31 @@ export function mountVideoUi(root: HTMLElement): void {
         }
         applyMask(cropped, ctx.mask, ctx.carvedFrame);
 
-        if (scaleBackInput.checked) {
-          const scaled = scaleFrame(
-            ctx.carvedFrame,
-            { w: ctx.mask.outW, h: ctx.mask.outH },
-            { w: crop.w, h: crop.h },
-          );
-          if (outCanvas.width !== scaled.width || outCanvas.height !== scaled.height) {
-            outCanvas.width = scaled.width;
-            outCanvas.height = scaled.height;
-          }
-          outCtx.putImageData(scaled, 0, 0);
-        } else {
-          if (
-            outCanvas.width !== ctx.carvedFrame.width ||
-            outCanvas.height !== ctx.carvedFrame.height
-          ) {
-            outCanvas.width = ctx.carvedFrame.width;
-            outCanvas.height = ctx.carvedFrame.height;
-          }
-          outCtx.putImageData(ctx.carvedFrame, 0, 0);
+        if (
+          outCanvas.width !== ctx.carvedFrame.width ||
+          outCanvas.height !== ctx.carvedFrame.height
+        ) {
+          outCanvas.width = ctx.carvedFrame.width;
+          outCanvas.height = ctx.carvedFrame.height;
+          applyOutCanvasDisplay();
         }
+        outCtx.putImageData(ctx.carvedFrame, 0, 0);
       }
 
       const now = performance.now();
       if (now - ctx.lastFrameSentAt > FRAME_SEND_INTERVAL_MS) {
-        // Send a copy of the cropped buffer (transferred for zero-copy on
-        // worker side). The local `cropped` buffer keeps its data because
-        // we copy first, then transfer the copy.
-        const copy = new Uint8ClampedArray(cropped.data);
+        // Transfer the cropped buffer to the worker (zero-copy). The
+        // `cropped` ImageData is single-use this RAF -- applyMask
+        // already finished above -- so transfer is safe.
+        const buf = cropped.data.buffer;
         ctx.worker.postMessage(
           {
             type: 'frame',
-            buffer: copy.buffer,
+            buffer: buf,
             width: cropped.width,
             height: cropped.height,
           },
-          [copy.buffer],
+          [buf],
         );
         ctx.lastFrameSentAt = now;
       }
@@ -484,6 +512,8 @@ export function mountVideoUi(root: HTMLElement): void {
         `render fps:     ${renderFps.toFixed(1)}`,
         `refine fps:     ${refineFps.toFixed(1)}`,
         `last refine:    ${live.lastRefineMs.toFixed(1)} ms`,
+        `alpha:          ${live.lastAlpha.toFixed(2)}`,
+        `refine scale:   ${live.lastRefineScale.toFixed(2)}`,
       ];
       statsEl.textContent = lines.join('\n');
 
@@ -502,6 +532,7 @@ export function mountVideoUi(root: HTMLElement): void {
     live.worker.postMessage({ type: 'stop' });
     live.worker.terminate();
     live.source.stop();
+    unmountVideo();
     live = null;
     statsEl.textContent = '(stopped)';
     cropOverlay.classList.add('hidden');
@@ -519,4 +550,11 @@ function clampPct(value: number, fallback: number): number {
 function clampInt(value: number, min: number, max: number, fallback: number): number {
   if (!Number.isFinite(value)) return fallback;
   return Math.max(min, Math.min(max, Math.floor(value)));
+}
+
+function clampAlpha(value: number): number {
+  if (!Number.isFinite(value) || value <= 0) return DEFAULT_ALPHA;
+  if (value > 1) return 1;
+  if (value < 0.05) return 0.05;
+  return value;
 }

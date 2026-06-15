@@ -68,6 +68,13 @@
           linear-gradient(45deg, #e0e0e0 25%, transparent 25%, transparent 75%, #e0e0e0 75%) 8px 8px/16px 16px;
         display: block;
       }
+      /* In scale-back mode the carved canvas has the small carved dims but
+         we want it displayed at crop size. CSS scaling here is free; on
+         opaque camera footage browser bilinear matches our premultiplied
+         scaler. */
+      .preview canvas.scale-back {
+        image-rendering: auto;
+      }
       .preview .label {
         font-size: 0.8rem;
         opacity: 0.7;
@@ -78,9 +85,11 @@
         max-width: 100%;
         line-height: 0;
       }
-      .camera-stage canvas {
+      .camera-stage video {
         max-width: 100%;
         height: auto;
+        display: block;
+        background: #000;
       }
       .crop-overlay {
         position: absolute;

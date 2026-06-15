@@ -287,6 +287,248 @@ export function refreshEnergyAfterSeamV(
   }
 }
 
+// --- Single-frame energy + EMA blend (live video refine path) -------------
+//
+// The refine worker can't afford to keep a ring of N raw frames and rebuild
+// a MAX-aggregated energy map every cycle: subject motion is "remembered"
+// for N cycles (ghost trails) and the per-cycle work scales with N. Instead
+// we maintain a single persistent energy buffer that's EMA-blended on every
+// new frame:
+//
+//   energyEma[i] = (1 - alpha) * energyEma[i] + alpha * frameEnergy[i]
+//
+// A new subject position contributes alpha (e.g. 0.25) on the first frame
+// and decays the old position geometrically. Catch-up time = ~ 1/alpha
+// frames instead of N cycles.
+//
+// `frameEnergyHFlat / VFlat` compute the single-frame gradient that gets
+// blended in. They are the existing aggregate functions with the cross-
+// frame loop stripped out.
+
+// Single-frame H-gradient energy at every pixel in (size.w x size.h).
+export function frameEnergyHFlat(
+  frame: ImageData,
+  size: ImageSize,
+  energy: Float32Array,
+  stride: number,
+  alphaThreshold: number = ALPHA_DELETE_THRESHOLD,
+): void {
+  const { w, h } = size;
+  const data = frame.data;
+  for (let y = 0; y < h; y += 1) {
+    const rowEnergy = y * stride;
+    const rowData = y * stride * 4;
+    for (let x = 0; x < w; x += 1) {
+      const i = rowData + x * 4;
+      let e: number;
+      if (data[i + 3] <= alphaThreshold) {
+        e = PIXEL_DELETE_ENERGY;
+      } else {
+        const mr = data[i];
+        const mg = data[i + 1];
+        const mb = data[i + 2];
+        e = 0;
+        if (x > 0) {
+          const il = i - 4;
+          const dr = data[il] - mr;
+          const dg = data[il + 1] - mg;
+          const db = data[il + 2] - mb;
+          e += dr * dr + dg * dg + db * db;
+        }
+        if (x + 1 < w) {
+          const ir = i + 4;
+          const dr = data[ir] - mr;
+          const dg = data[ir + 1] - mg;
+          const db = data[ir + 2] - mb;
+          e += dr * dr + dg * dg + db * db;
+        }
+      }
+      energy[rowEnergy + x] = e;
+    }
+  }
+}
+
+// Single-frame V-gradient energy at every pixel in (size.w x size.h).
+export function frameEnergyVFlat(
+  frame: ImageData,
+  size: ImageSize,
+  energy: Float32Array,
+  stride: number,
+  alphaThreshold: number = ALPHA_DELETE_THRESHOLD,
+): void {
+  const { w, h } = size;
+  const data = frame.data;
+  const rowBytes = stride * 4;
+  for (let y = 0; y < h; y += 1) {
+    const rowEnergy = y * stride;
+    const rowData = y * rowBytes;
+    for (let x = 0; x < w; x += 1) {
+      const i = rowData + x * 4;
+      let e: number;
+      if (data[i + 3] <= alphaThreshold) {
+        e = PIXEL_DELETE_ENERGY;
+      } else {
+        const mr = data[i];
+        const mg = data[i + 1];
+        const mb = data[i + 2];
+        e = 0;
+        if (y > 0) {
+          const it = i - rowBytes;
+          const dr = data[it] - mr;
+          const dg = data[it + 1] - mg;
+          const db = data[it + 2] - mb;
+          e += dr * dr + dg * dg + db * db;
+        }
+        if (y + 1 < h) {
+          const ib = i + rowBytes;
+          const dr = data[ib] - mr;
+          const dg = data[ib + 1] - mg;
+          const db = data[ib + 2] - mb;
+          e += dr * dr + dg * dg + db * db;
+        }
+      }
+      energy[rowEnergy + x] = e;
+    }
+  }
+}
+
+// In-place EMA blend: target[i] = (1 - alpha) * target[i] + alpha * sample[i].
+// Iterates min(target.length, sample.length) entries. Garbage cells outside
+// the logical region don't matter (they're never read by the DP search).
+export function emaBlend(
+  target: Float32Array,
+  sample: Float32Array,
+  alpha: number,
+): void {
+  const oneMinusAlpha = 1 - alpha;
+  const n = Math.min(target.length, sample.length);
+  for (let i = 0; i < n; i += 1) {
+    target[i] = oneMinusAlpha * target[i] + alpha * sample[i];
+  }
+}
+
+// After deleting an H seam, refresh the two cells per row whose neighbour
+// relationships changed. Unlike `refreshEnergyAfterSeamH`, this writes the
+// single-frame H-gradient directly into `energy` (no EMA blend). Mixing
+// frames within one carve cycle isn't useful: the EMA happens across
+// cycles via emaBlend(), and we want the carve to see consistent values.
+export function refreshEnergyFromFrameH(
+  frame: ImageData,
+  energy: Float32Array,
+  seamRowX: Int16Array,
+  size: ImageSize,
+  stride: number,
+  alphaThreshold: number = ALPHA_DELETE_THRESHOLD,
+): void {
+  const { h, w } = size;
+  for (let y = 0; y < h; y += 1) {
+    const sx = seamRowX[y];
+    if (sx - 1 >= 0) {
+      recomputeFrameAtH(frame, energy, sx - 1, y, size, stride, alphaThreshold);
+    }
+    if (sx < w) {
+      recomputeFrameAtH(frame, energy, sx, y, size, stride, alphaThreshold);
+    }
+  }
+}
+
+export function refreshEnergyFromFrameV(
+  frame: ImageData,
+  energy: Float32Array,
+  seamColY: Int16Array,
+  size: ImageSize,
+  stride: number,
+  alphaThreshold: number = ALPHA_DELETE_THRESHOLD,
+): void {
+  const { w, h } = size;
+  for (let x = 0; x < w; x += 1) {
+    const sy = seamColY[x];
+    if (sy - 1 >= 0) {
+      recomputeFrameAtV(frame, energy, x, sy - 1, size, stride, alphaThreshold);
+    }
+    if (sy < h) {
+      recomputeFrameAtV(frame, energy, x, sy, size, stride, alphaThreshold);
+    }
+  }
+}
+
+function recomputeFrameAtH(
+  frame: ImageData,
+  energy: Float32Array,
+  x: number,
+  y: number,
+  size: ImageSize,
+  stride: number,
+  alphaThreshold: number,
+): void {
+  const { w } = size;
+  const data = frame.data;
+  const i = (y * stride + x) * 4;
+  let e: number;
+  if (data[i + 3] <= alphaThreshold) {
+    e = PIXEL_DELETE_ENERGY;
+  } else {
+    const mr = data[i];
+    const mg = data[i + 1];
+    const mb = data[i + 2];
+    e = 0;
+    if (x > 0) {
+      const il = i - 4;
+      const dr = data[il] - mr;
+      const dg = data[il + 1] - mg;
+      const db = data[il + 2] - mb;
+      e += dr * dr + dg * dg + db * db;
+    }
+    if (x + 1 < w) {
+      const ir = i + 4;
+      const dr = data[ir] - mr;
+      const dg = data[ir + 1] - mg;
+      const db = data[ir + 2] - mb;
+      e += dr * dr + dg * dg + db * db;
+    }
+  }
+  energy[y * stride + x] = e;
+}
+
+function recomputeFrameAtV(
+  frame: ImageData,
+  energy: Float32Array,
+  x: number,
+  y: number,
+  size: ImageSize,
+  stride: number,
+  alphaThreshold: number,
+): void {
+  const { h } = size;
+  const data = frame.data;
+  const rowBytes = stride * 4;
+  const i = y * rowBytes + x * 4;
+  let e: number;
+  if (data[i + 3] <= alphaThreshold) {
+    e = PIXEL_DELETE_ENERGY;
+  } else {
+    const mr = data[i];
+    const mg = data[i + 1];
+    const mb = data[i + 2];
+    e = 0;
+    if (y > 0) {
+      const it = i - rowBytes;
+      const dr = data[it] - mr;
+      const dg = data[it + 1] - mg;
+      const db = data[it + 2] - mb;
+      e += dr * dr + dg * dg + db * db;
+    }
+    if (y + 1 < h) {
+      const ib = i + rowBytes;
+      const dr = data[ib] - mr;
+      const dg = data[ib + 1] - mg;
+      const db = data[ib + 2] - mb;
+      e += dr * dr + dg * dg + db * db;
+    }
+  }
+  energy[y * stride + x] = e;
+}
+
 // --- DP seam search (flat buffers, no per-cell objects) --------------------
 
 // H seam (top-to-bottom). Output: seamRowX[y] = x of seam pixel at row y.

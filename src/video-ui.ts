@@ -32,7 +32,7 @@ const FRAME_SEND_INTERVAL_MS = 50;
 // while still tracking real subject motion within ~50 ms.
 //
 // Lower -> smoother / more lag, higher -> snappier / more flicker.
-const DEFAULT_MASK_SMOOTH_ALPHA = 0.25;
+const DEFAULT_MASK_SMOOTH_ALPHA = 0.05;
 
 type Mode = 'idle' | 'starting' | 'live' | 'error';
 

@@ -22,12 +22,38 @@ const DEFAULT_CROP_H = 240;
 // proportional to refine rate rather than render rate.
 const FRAME_SEND_INTERVAL_MS = 50;
 
+// Render-thread mask smoothing. The worker publishes a fresh mask each
+// refine cycle, but small numerical wiggles in the EMA energy regularly
+// flip the DP between two near-equal seams, so adjacent published masks
+// shift output pixels by 1-2 px even when the subject is still. We keep
+// a float copy of the displayed source coords and EMA-blend it toward
+// each new worker mask per render frame; rounded ints feed applyMask.
+// 1-px pick flips fade in over ~3-4 render frames instead of snapping,
+// while still tracking real subject motion within ~50 ms.
+//
+// Lower -> smoother / more lag, higher -> snappier / more flicker.
+const DEFAULT_MASK_SMOOTH_ALPHA = 0.25;
+
 type Mode = 'idle' | 'starting' | 'live' | 'error';
+
+// SeamMask plus the float source-coord buffers we EMA-blend toward the
+// latest worker mask. The int sourceX/sourceY are derived (rounded) from
+// the floats on every blend, so SmoothMask is a drop-in for applyMask.
+type SmoothMask = SeamMask & {
+  sourceXf: Float32Array;
+  sourceYf: Float32Array;
+};
 
 type LiveCtx = {
   source: FrameSource;
   worker: Worker;
   mask: SeamMask;
+  // EMA-blended copy of `mask` used for actual rendering; smooths sub-
+  // pixel cycle-to-cycle flicker without affecting the carve algorithm.
+  smoothMask: SmoothMask | null;
+  // Render-thread mask EMA blend factor. Live-tunable via the Smoothing
+  // input (no Apply needed); the render loop reads this every tick.
+  smoothAlpha: number;
   carvedFrame: ImageData;
   renderFrames: number;
   workerMasks: number;
@@ -85,6 +111,10 @@ export function mountVideoUi(root: HTMLElement): void {
         Responsiveness
         <input type="number" id="alpha" min="0.05" max="1" step="0.05" value="${DEFAULT_ALPHA}" />
       </label>
+      <label title="Render-time smoothing of the displayed seam mask. Lower = more stable output but small motion lag; higher = no lag but sub-pixel flicker shows through. 1.0 disables smoothing.">
+        Smoothing
+        <input type="number" id="smooth" min="0.05" max="1" step="0.05" value="${DEFAULT_MASK_SMOOTH_ALPHA}" />
+      </label>
       <label title="After carving, display each frame stretched back to the crop dimensions (browser CSS scaling). Output keeps original size with low-energy areas compressed.">
         <input type="checkbox" id="scale-back" />
         Scale back to crop size
@@ -112,6 +142,7 @@ export function mountVideoUi(root: HTMLElement): void {
   const heightInput = root.querySelector<HTMLInputElement>('#height-pct')!;
   const resInput = root.querySelector<HTMLSelectElement>('#res-hint')!;
   const alphaInput = root.querySelector<HTMLInputElement>('#alpha')!;
+  const smoothInput = root.querySelector<HTMLInputElement>('#smooth')!;
   const cropWInput = root.querySelector<HTMLInputElement>('#crop-w')!;
   const cropHInput = root.querySelector<HTMLInputElement>('#crop-h')!;
   const scaleBackInput = root.querySelector<HTMLInputElement>('#scale-back')!;
@@ -303,6 +334,8 @@ export function mountVideoUi(root: HTMLElement): void {
         source,
         worker,
         mask: identityMask(crop.w, crop.h, 0),
+        smoothMask: null,
+        smoothAlpha: clampAlpha(smoothInput.valueAsNumber),
         carvedFrame: new ImageData(outW, outH),
         renderFrames: 0,
         workerMasks: 0,
@@ -389,6 +422,10 @@ export function mountVideoUi(root: HTMLElement): void {
 
     live.carvedFrame = new ImageData(outW, outH);
     live.mask = identityMask(crop.w, crop.h, live.mask.generation);
+    // Geometry changes (crop or width/height %) invalidate any blended
+    // history; ensureSmoothMaskMatches re-seeds it from the first new
+    // mask in the render loop.
+    live.smoothMask = null;
     live.lastAlpha = alpha;
 
     live.worker.postMessage({
@@ -411,6 +448,13 @@ export function mountVideoUi(root: HTMLElement): void {
     if (!live) return;
     applyOutCanvasDisplay();
     updateOutLabel();
+  });
+
+  // Smoothing is a render-thread parameter -- no worker re-init needed,
+  // so it's live-tunable as the user types/scrubs without clicking Apply.
+  smoothInput.addEventListener('input', () => {
+    if (!live) return;
+    live.smoothAlpha = clampAlpha(smoothInput.valueAsNumber);
   });
 
   function mountVideo(video: HTMLVideoElement): void {
@@ -454,7 +498,15 @@ export function mountVideoUi(root: HTMLElement): void {
         ) {
           ctx.carvedFrame = new ImageData(ctx.mask.outW, ctx.mask.outH);
         }
-        applyMask(cropped, ctx.mask, ctx.carvedFrame);
+        // EMA-blend the rendered (smoothed) mask toward the latest mask
+        // from the worker. The blend runs every render frame, even when
+        // the worker hasn't published a fresh mask, so the displayed
+        // coords converge smoothly between worker updates. The carve
+        // itself is unchanged; only the per-pixel sampling positions
+        // for `applyMask` are smoothed.
+        ensureSmoothMaskMatches(ctx, ctx.mask);
+        blendSmoothMask(ctx.smoothMask!, ctx.mask, ctx.smoothAlpha);
+        applyMask(cropped, ctx.smoothMask!, ctx.carvedFrame);
 
         if (
           outCanvas.width !== ctx.carvedFrame.width ||
@@ -513,6 +565,7 @@ export function mountVideoUi(root: HTMLElement): void {
         `refine fps:     ${refineFps.toFixed(1)}`,
         `last refine:    ${live.lastRefineMs.toFixed(1)} ms`,
         `alpha:          ${live.lastAlpha.toFixed(2)}`,
+        `smoothing:      ${live.smoothAlpha.toFixed(2)}`,
         `refine scale:   ${live.lastRefineScale.toFixed(2)}`,
       ];
       statsEl.textContent = lines.join('\n');
@@ -557,4 +610,66 @@ function clampAlpha(value: number): number {
   if (value > 1) return 1;
   if (value < 0.05) return 0.05;
   return value;
+}
+
+// (Re)allocate ctx.smoothMask if its geometry doesn't match the latest mask
+// from the worker. Seeds the float buffers directly from the latest int
+// coords (no smoothing across a geometry change -- there's nothing useful
+// to blend with). Cheap: an O(outW * outH) loop on the rare path.
+function ensureSmoothMaskMatches(ctx: LiveCtx, latest: SeamMask): void {
+  const sm = ctx.smoothMask;
+  if (
+    sm &&
+    sm.outW === latest.outW &&
+    sm.outH === latest.outH &&
+    sm.inW === latest.inW &&
+    sm.inH === latest.inH
+  ) {
+    return;
+  }
+  const n = latest.outW * latest.outH;
+  const sourceXf = new Float32Array(n);
+  const sourceYf = new Float32Array(n);
+  const sourceX = new Int16Array(n);
+  const sourceY = new Int16Array(n);
+  for (let i = 0; i < n; i += 1) {
+    sourceXf[i] = latest.sourceX[i];
+    sourceYf[i] = latest.sourceY[i];
+    sourceX[i] = latest.sourceX[i];
+    sourceY[i] = latest.sourceY[i];
+  }
+  ctx.smoothMask = {
+    inW: latest.inW,
+    inH: latest.inH,
+    outW: latest.outW,
+    outH: latest.outH,
+    sourceX,
+    sourceY,
+    sourceXf,
+    sourceYf,
+    generation: latest.generation,
+  };
+}
+
+// In-place EMA blend of the smooth mask's float source coords toward the
+// latest worker mask's int coords. Re-derives the int sourceX/sourceY
+// (rounded) so applyMask reads the smoothed positions. Runs every render
+// frame -- when the worker hasn't published a fresh mask, the latest
+// argument is the same one we already converged on, so the blend is a
+// near-no-op (target == current after a few frames).
+function blendSmoothMask(smooth: SmoothMask, latest: SeamMask, blend: number): void {
+  const inv = 1 - blend;
+  const { sourceXf, sourceYf, sourceX, sourceY } = smooth;
+  const tx = latest.sourceX;
+  const ty = latest.sourceY;
+  const n = sourceXf.length;
+  for (let i = 0; i < n; i += 1) {
+    const xf = inv * sourceXf[i] + blend * tx[i];
+    const yf = inv * sourceYf[i] + blend * ty[i];
+    sourceXf[i] = xf;
+    sourceYf[i] = yf;
+    sourceX[i] = Math.round(xf);
+    sourceY[i] = Math.round(yf);
+  }
+  smooth.generation = latest.generation;
 }
